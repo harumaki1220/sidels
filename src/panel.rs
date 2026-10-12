@@ -10,11 +10,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 /// 同じディレクトリでもこの間隔ごとに読み直す（ファイルの追加・削除を拾うため）
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// 右側のファイル一覧パネル
 pub struct FilePanel {
     /// シェルのプロセス番号。今いるディレクトリを調べるのに使う
     shell_pid: Option<u32>,
-    /// 今表示しているディレクトリ
     dir: PathBuf,
     entries: Vec<Entry>,
     /// 読み込みに失敗したときのメッセージ
@@ -115,7 +113,6 @@ impl Entry {
         } else {
             (self.name.clone(), Style::default())
         };
-        // 隠しファイルは薄く表示する
         let style = if self.is_hidden() {
             style.add_modifier(Modifier::DIM)
         } else {

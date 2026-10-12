@@ -20,9 +20,7 @@ const TOGGLE_PANEL_KEY: &[u8] = b"\x1b[24~";
 enum AppEvent {
     /// シェルが何か出力した（画面を描き直す合図）
     Output,
-    /// シェルが終了した
     Exited,
-    /// パネルの出し入れキーが押された
     TogglePanel,
 }
 
@@ -36,7 +34,6 @@ fn main() -> Result<()> {
 }
 
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {
-    // 最初の画面の大きさから、左ペインの大きさを決める
     let size = terminal.size()?;
     let mut panel_visible = true;
     let (left, _) = split(Rect::new(0, 0, size.width, size.height), panel_visible);
@@ -51,7 +48,6 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     drop(pair.slave);
     let master = pair.master;
 
-    // 右側のファイル一覧。シェルのプロセス番号から、今いるディレクトリを追いかける
     let mut panel = FilePanel::new(child.process_id(), std::env::current_dir()?);
 
     // シェルの出力を解釈して今の画面をメモリ上に持つ仮想端末
