@@ -1,13 +1,14 @@
 use anyhow::Result;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{self, Read, Write};
 
 fn main() -> Result<()> {
     let pty_system = native_pty_system();
+    let (cols, rows) = terminal::size()?;
     let pair = pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 80,
+        rows,
+        cols,
         pixel_width: 0,
         pixel_height: 0,
     })?;
@@ -20,7 +21,7 @@ fn main() -> Result<()> {
     // キーボード → zsh
 
     let mut writer = pair.master.take_writer()?;
-    enable_raw_mode()?;
+    terminal::enable_raw_mode()?;
 
     std::thread::spawn(move || {
         let mut stdin = io::stdin();
@@ -53,6 +54,6 @@ fn main() -> Result<()> {
         stdout.flush()?;
     }
 
-    disable_raw_mode()?;
+    terminal::disable_raw_mode()?;
     Ok(())
 }
