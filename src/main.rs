@@ -15,6 +15,27 @@ fn main() -> Result<()> {
     cmd.cwd(std::env::current_dir()?);
     let child = pair.slave.spawn_command(cmd)?;
 
+    // キーボード → zsh
+
+    let mut writer = pair.master.take_writer()?;
+
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stdin.read(&mut buf).unwrap();
+
+            if n == 0 {
+                break;
+            }
+
+            writer.write_all(&buf[..n]).unwrap();
+            writer.flush().unwrap();
+        }
+    });
+
+    // zshの出力 → 画面
+
     let mut reader: Box<dyn Read + Send> = pair.master.try_clone_reader()?;
     let mut buf = [0u8; 1024];
     let mut stdout = io::stdout();
