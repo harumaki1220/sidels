@@ -13,12 +13,17 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 mod panel;
 use panel::FilePanel;
 
+/// パネルを出し入れするキー（F12）。端末からはこのバイト列で届く
+const TOGGLE_PANEL_KEY: &[u8] = b"\x1b[24~";
+
 /// 別スレッドからメインループに届く知らせ
 enum AppEvent {
     /// シェルが何か出力した（画面を描き直す合図）
     Output,
     /// シェルが終了した
     Exited,
+    /// パネルの出し入れキーが押された
+    TogglePanel,
 }
 
 fn main() -> Result<()> {
@@ -33,7 +38,8 @@ fn main() -> Result<()> {
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     // 最初の画面の大きさから、左ペインの大きさを決める
     let size = terminal.size()?;
-    let (left, _) = split(Rect::new(0, 0, size.width, size.height));
+    let mut panel_visible = true;
+    let (left, _) = split(Rect::new(0, 0, size.width, size.height), panel_visible);
     let mut pty_size = pty_size_for(left);
 
     // 偽物の端末を左ペインの大きさで作り、中でシェルを起動する
@@ -56,21 +62,23 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     )));
 
     let (tx, rx) = mpsc::channel();
-    spawn_output_thread(master.try_clone_reader()?, Arc::clone(&parser), tx);
-    spawn_input_thread(master.take_writer()?);
+    spawn_output_thread(master.try_clone_reader()?, Arc::clone(&parser), tx.clone());
+    spawn_input_thread(master.take_writer()?, tx);
 
     loop {
         // ウィンドウの大きさが変わっていたら、PTYと仮想端末も合わせる
         let size = terminal.size()?;
-        let (left, right) = split(Rect::new(0, 0, size.width, size.height));
+        let (left, right) = split(Rect::new(0, 0, size.width, size.height), panel_visible);
         let new_size = pty_size_for(left);
         if (new_size.rows, new_size.cols) != (pty_size.rows, pty_size.cols) {
             resize(master.as_ref(), &parser, new_size)?;
             pty_size = new_size;
         }
 
-        // シェルがcdしていたら、パネルの中身を入れ替える
-        panel.update();
+        // 隠している間はディレクトリを読みに行かない
+        if panel_visible {
+            panel.update();
+        }
 
         terminal.draw(|frame| {
             let parser = parser.lock().unwrap();
@@ -85,11 +93,12 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 frame.set_cursor_position((left.x + col, left.y + row));
             }
 
-            // 右: ファイル一覧パネル
-            panel.render(frame, right);
+            if panel_visible {
+                panel.render(frame, right);
+            }
         })?;
 
-        if wait_for_event(&rx)? {
+        if wait_for_event(&rx, &mut panel_visible)? {
             break;
         }
     }
@@ -98,8 +107,11 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
-/// 画面を左（シェル）7 : 右（パネル）3 に分ける
-fn split(area: Rect) -> (Rect, Rect) {
+/// 画面を左（シェル）7 : 右（パネル）3 に分ける。パネルを隠しているときはシェルが全体を使う
+fn split(area: Rect, panel_visible: bool) -> (Rect, Rect) {
+    if !panel_visible {
+        return (area, Rect::default());
+    }
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(area);
     (left, right)
@@ -148,8 +160,8 @@ fn spawn_output_thread(
     });
 }
 
-/// キーボード → シェル
-fn spawn_input_thread(mut writer: Box<dyn Write + Send>) {
+/// キーボード → シェル。パネルの出し入れキーだけは抜き取ってメインループに知らせる
+fn spawn_input_thread(mut writer: Box<dyn Write + Send>, tx: Sender<AppEvent>) {
     thread::spawn(move || {
         let mut stdin = io::stdin();
         let mut buf = [0u8; 1024];
@@ -157,7 +169,16 @@ fn spawn_input_thread(mut writer: Box<dyn Write + Send>) {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if writer.write_all(&buf[..n]).is_err() || writer.flush().is_err() {
+                    let (input, toggles) = take_toggle_keys(&buf[..n]);
+                    for _ in 0..toggles {
+                        if tx.send(AppEvent::TogglePanel).is_err() {
+                            return;
+                        }
+                    }
+                    if input.is_empty() {
+                        continue;
+                    }
+                    if writer.write_all(&input).is_err() || writer.flush().is_err() {
                         break;
                     }
                 }
@@ -166,17 +187,36 @@ fn spawn_input_thread(mut writer: Box<dyn Write + Send>) {
     });
 }
 
+/// 入力から出し入れキーを取り除き、残りのバイト列と押された回数を返す
+fn take_toggle_keys(mut input: &[u8]) -> (Vec<u8>, usize) {
+    let mut rest = Vec::with_capacity(input.len());
+    let mut toggles = 0;
+    while let Some(pos) = input
+        .windows(TOGGLE_PANEL_KEY.len())
+        .position(|w| w == TOGGLE_PANEL_KEY)
+    {
+        rest.extend_from_slice(&input[..pos]);
+        toggles += 1;
+        input = &input[pos + TOGGLE_PANEL_KEY.len()..];
+    }
+    rest.extend_from_slice(input);
+    (rest, toggles)
+}
+
 /// 次の知らせを待つ。シェルが終了したら true を返す。
 /// 何も来なくても 50ms ごとに戻り、ウィンドウサイズの変化を拾えるようにしている
-fn wait_for_event(rx: &Receiver<AppEvent>) -> Result<bool> {
-    match rx.recv_timeout(Duration::from_millis(50)) {
-        Ok(AppEvent::Exited) | Err(RecvTimeoutError::Disconnected) => return Ok(true),
-        Ok(AppEvent::Output) | Err(RecvTimeoutError::Timeout) => {}
-    }
+fn wait_for_event(rx: &Receiver<AppEvent>, panel_visible: &mut bool) -> Result<bool> {
+    let first = match rx.recv_timeout(Duration::from_millis(50)) {
+        Ok(event) => Some(event),
+        Err(RecvTimeoutError::Timeout) => None,
+        Err(RecvTimeoutError::Disconnected) => return Ok(true),
+    };
     // 出力が立て続けに届いたときは、まとめて1回だけ描き直す
-    while let Ok(event) = rx.try_recv() {
-        if let AppEvent::Exited = event {
-            return Ok(true);
+    for event in first.into_iter().chain(rx.try_iter()) {
+        match event {
+            AppEvent::Output => {}
+            AppEvent::TogglePanel => *panel_visible = !*panel_visible,
+            AppEvent::Exited => return Ok(true),
         }
     }
     Ok(false)
