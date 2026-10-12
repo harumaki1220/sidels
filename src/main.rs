@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{self, Read, Write};
 
@@ -14,10 +15,12 @@ fn main() -> Result<()> {
     let mut cmd = CommandBuilder::new("zsh");
     cmd.cwd(std::env::current_dir()?);
     let child = pair.slave.spawn_command(cmd)?;
+    drop(pair.slave);
 
     // キーボード → zsh
 
     let mut writer = pair.master.take_writer()?;
+    enable_raw_mode()?;
 
     std::thread::spawn(move || {
         let mut stdin = io::stdin();
@@ -49,5 +52,7 @@ fn main() -> Result<()> {
         stdout.write_all(&buf[..n])?;
         stdout.flush()?;
     }
+
+    disable_raw_mode()?;
     Ok(())
 }
