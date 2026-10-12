@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use globset::{GlobBuilder, GlobMatcher};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -18,11 +19,16 @@ pub struct FilePanel {
     /// 読み込みに失敗したときのメッセージ
     error: Option<String>,
     last_refresh: Instant,
+    /// 最後に受け取ったコマンドライン。変わったときだけ glob を作り直す
+    command_line: String,
+    globs: Vec<GlobMatcher>,
 }
 
 struct Entry {
     name: String,
     is_dir: bool,
+    /// コマンドライン中の glob にマッチしている
+    highlighted: bool,
 }
 
 impl FilePanel {
@@ -33,6 +39,8 @@ impl FilePanel {
             entries: Vec::new(),
             error: None,
             last_refresh: Instant::now(),
+            command_line: String::new(),
+            globs: Vec::new(),
         };
         panel.reload();
         panel
@@ -50,6 +58,16 @@ impl FilePanel {
         if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.reload();
         }
+    }
+
+    /// 入力中のコマンドラインを受け取り、その中の glob にマッチするファイルに印をつける
+    pub fn set_command_line(&mut self, line: &str) {
+        if line == self.command_line {
+            return;
+        }
+        self.command_line = line.to_string();
+        self.globs = parse_globs(line);
+        self.mark_matches();
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -80,11 +98,21 @@ impl FilePanel {
             Ok(entries) => {
                 self.entries = entries;
                 self.error = None;
+                self.mark_matches();
             }
             Err(err) => {
                 self.entries.clear();
                 self.error = Some(format!("読み込めません: {err}"));
             }
+        }
+    }
+
+    fn mark_matches(&mut self) {
+        for entry in &mut self.entries {
+            entry.highlighted = self
+                .globs
+                .iter()
+                .any(|glob| glob_matches(glob, &entry.name));
         }
     }
 
@@ -118,6 +146,11 @@ impl Entry {
         } else {
             style
         };
+        let style = if self.highlighted {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
+        };
         ListItem::new(Line::styled(text, style))
     }
 }
@@ -130,6 +163,7 @@ fn read_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
             name: entry.file_name().to_string_lossy().into_owned(),
             // シンボリックリンクの先がディレクトリなら、ディレクトリとして扱う
             is_dir: entry.path().is_dir(),
+            highlighted: false,
         })
         .collect();
 
@@ -140,4 +174,24 @@ fn read_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
+}
+
+/// コマンドラインから glob らしい単語を取り出す。
+/// 引用符やバックスラッシュ付きのものはシェルが展開しないので除く。
+/// / を含むものはパネルに出ていない別のディレクトリを指すので、今は扱わない
+fn parse_globs(line: &str) -> Vec<GlobMatcher> {
+    line.split_whitespace()
+        .filter(|word| word.contains(['*', '?', '[']))
+        .filter(|word| !word.contains(['/', '\\', '\'', '"']))
+        .filter_map(|word| GlobBuilder::new(word).literal_separator(true).build().ok())
+        .map(|glob| glob.compile_matcher())
+        .collect()
+}
+
+/// zsh と同じく、隠しファイルはパターンが . で始まるときだけマッチさせる
+fn glob_matches(glob: &GlobMatcher, name: &str) -> bool {
+    if name.starts_with('.') && !glob.glob().glob().starts_with('.') {
+        return false;
+    }
+    glob.is_match(name)
 }

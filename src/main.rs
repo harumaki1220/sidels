@@ -87,6 +87,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         // 隠している間はディレクトリを読みに行かない
         if panel_visible {
             panel.update();
+            panel.set_command_line(&cursor_line(&parser.lock().unwrap()));
         }
 
         terminal.draw(|frame| {
@@ -117,6 +118,21 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
     child.wait()?;
     Ok(())
+}
+
+/// カーソルがある行の文字列。プロンプトも混ざるが、glob を探すだけなら問題ない。
+/// vim などが別画面を使っている間は、シェルの入力ではないので空にする
+fn cursor_line(parser: &vt100::Parser) -> String {
+    let screen = parser.screen();
+    if screen.alternate_screen() {
+        return String::new();
+    }
+    let (row, _) = screen.cursor_position();
+    let (_, cols) = screen.size();
+    screen
+        .rows(0, cols)
+        .nth(usize::from(row))
+        .unwrap_or_default()
 }
 
 /// パネルを出すかどうか。普段は画面幅で自動で決め、F12 が押されたらそれに従う

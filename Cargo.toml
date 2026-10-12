@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 crossterm = "0.29.0"
+globset = "0.4.20"
 portable-pty = "0.9.0"
 ratatui = "0.30"
 tui-term = "0.3.4"

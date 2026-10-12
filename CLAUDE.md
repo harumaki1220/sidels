@@ -36,6 +36,7 @@ cd のたびに ls を打つ手間をなくすのが目的。Rust 製。
   - `/proc/<シェルのpid>/cwd` でシェルの現在地を取得し、`read_dir` で中身を表示
   - cd したら即読み直し、同じ場所でも 1 秒ごとに読み直す
   - 並び順: ディレクトリ → ファイル、隠しファイルは後ろで薄く表示
+  - glob ハイライト: メインがカーソル行の文字列を渡し、`*` `?` `[` を含む単語を globset でマッチして反転表示。プロンプトが混ざっても glob を含まないので実害なし。別画面（vim など）の間は空を渡す。`/` や引用符を含む単語は対象外
 
 ### ハマりどころ（壊さないこと）
 
@@ -45,7 +46,7 @@ cd のたびに ls を打つ手間をなくすのが目的。Rust 製。
 
 ## 依存
 
-anyhow / crossterm 0.29 / portable-pty 0.9 / ratatui 0.30 / tui-term 0.3.4 / vt100 0.16
+anyhow / crossterm 0.29 / globset 0.4 / portable-pty 0.9 / ratatui 0.30 / tui-term 0.3.4 / vt100 0.16
 （ratatui・tui-term・vt100・crossterm はバージョンの組み合わせが合っている必要がある）
 
 ## 未対応・既知の制限
