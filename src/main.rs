@@ -8,8 +8,10 @@ use anyhow::Result;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::widgets::{Block, Borders};
 use tui_term::widget::{Cursor, PseudoTerminal};
+
+mod panel;
+use panel::FilePanel;
 
 /// 別スレッドからメインループに届く知らせ
 enum AppEvent {
@@ -43,6 +45,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     drop(pair.slave);
     let master = pair.master;
 
+    // 右側のファイル一覧。シェルのプロセス番号から、今いるディレクトリを追いかける
+    let mut panel = FilePanel::new(child.process_id(), std::env::current_dir()?);
+
     // シェルの出力を解釈して今の画面をメモリ上に持つ仮想端末
     let parser = Arc::new(Mutex::new(vt100::Parser::new(
         pty_size.rows,
@@ -64,6 +69,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             pty_size = new_size;
         }
 
+        // シェルがcdしていたら、パネルの中身を入れ替える
+        panel.update();
+
         terminal.draw(|frame| {
             let parser = parser.lock().unwrap();
             let screen = parser.screen();
@@ -77,9 +85,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 frame.set_cursor_position((left.x + col, left.y + row));
             }
 
-            // 右: ファイル一覧パネル（中身はまだ空）
-            let panel = Block::default().borders(Borders::LEFT).title(" files ");
-            frame.render_widget(panel, right);
+            // 右: ファイル一覧パネル
+            panel.render(frame, right);
         })?;
 
         if wait_for_event(&rx)? {
