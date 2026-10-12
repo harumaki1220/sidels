@@ -16,8 +16,13 @@ use panel::FilePanel;
 /// パネルを出し入れするキー（F12）。端末からはこのバイト列で届く
 const TOGGLE_PANEL_KEY: &[u8] = b"\x1b[24~";
 
-/// 画面全体がこの列数未満なら、シェルの幅を守るためにパネルを自動で畳む
-const MIN_WIDTH_FOR_PANEL: u16 = 100;
+/// パネルの幅（左の区切り線を含む）
+const PANEL_WIDTH: u16 = 28;
+
+/// パネルを出してもシェルにこれだけの幅が残らないなら、パネルを自動で畳む
+const MIN_SHELL_WIDTH: u16 = 80;
+
+const MIN_WIDTH_FOR_PANEL: u16 = MIN_SHELL_WIDTH + PANEL_WIDTH;
 
 /// 別スレッドからメインループに届く知らせ
 enum AppEvent {
@@ -147,13 +152,15 @@ impl PanelVisibility {
     }
 }
 
-/// 画面を左（シェル）7 : 右（パネル）3 に分ける。パネルを隠しているときはシェルが全体を使う
+/// パネルを右端に固定幅で置き、残りを全部シェルに渡す。パネルを隠しているときはシェルが全体を使う
 fn split(area: Rect, panel_visible: bool) -> (Rect, Rect) {
     if !panel_visible {
         return (area, Rect::default());
     }
+    // 狭い画面で F12 により無理やり出したときも、シェルが半分を下回らないようにする
+    let panel_width = PANEL_WIDTH.min(area.width / 2);
     let [left, right] =
-        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(area);
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(panel_width)]).areas(area);
     (left, right)
 }
 
