@@ -16,6 +16,9 @@ use panel::FilePanel;
 /// パネルを出し入れするキー（F12）。端末からはこのバイト列で届く
 const TOGGLE_PANEL_KEY: &[u8] = b"\x1b[24~";
 
+/// 画面全体がこの列数未満なら、シェルの幅を守るためにパネルを自動で畳む
+const MIN_WIDTH_FOR_PANEL: u16 = 100;
+
 /// 別スレッドからメインループに届く知らせ
 enum AppEvent {
     /// シェルが何か出力した（画面を描き直す合図）
@@ -35,8 +38,11 @@ fn main() -> Result<()> {
 
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let size = terminal.size()?;
-    let mut panel_visible = true;
-    let (left, _) = split(Rect::new(0, 0, size.width, size.height), panel_visible);
+    let mut visibility = PanelVisibility::new(size.width);
+    let (left, _) = split(
+        Rect::new(0, 0, size.width, size.height),
+        visibility.is_visible(),
+    );
     let mut pty_size = pty_size_for(left);
 
     // 偽物の端末を左ペインの大きさで作り、中でシェルを起動する
@@ -64,7 +70,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     loop {
         // ウィンドウの大きさが変わっていたら、PTYと仮想端末も合わせる
         let size = terminal.size()?;
-        let (left, right) = split(Rect::new(0, 0, size.width, size.height), panel_visible);
+        visibility.set_width(size.width);
+        let panel_visible = visibility.is_visible();
+        let (left, _) = split(Rect::new(0, 0, size.width, size.height), panel_visible);
         let new_size = pty_size_for(left);
         if (new_size.rows, new_size.cols) != (pty_size.rows, pty_size.cols) {
             resize(master.as_ref(), &parser, new_size)?;
@@ -77,6 +85,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         }
 
         terminal.draw(|frame| {
+            // draw は直前に画面を測り直すので、size() の後にウィンドウが縮んでいることがある。
+            // はみ出して書くとパニックするので、範囲はここで改めて計算する
+            let (left, right) = split(frame.area(), panel_visible);
             let parser = parser.lock().unwrap();
             let screen = parser.screen();
 
@@ -94,13 +105,46 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             }
         })?;
 
-        if wait_for_event(&rx, &mut panel_visible)? {
+        if wait_for_event(&rx, &mut visibility)? {
             break;
         }
     }
 
     child.wait()?;
     Ok(())
+}
+
+/// パネルを出すかどうか。普段は画面幅で自動で決め、F12 が押されたらそれに従う
+struct PanelVisibility {
+    /// F12 で決めた表示状態。None なら画面幅で自動判定
+    forced: Option<bool>,
+    wide: bool,
+}
+
+impl PanelVisibility {
+    fn new(width: u16) -> Self {
+        Self {
+            forced: None,
+            wide: width >= MIN_WIDTH_FOR_PANEL,
+        }
+    }
+
+    /// 幅がしきい値をまたいだら、F12 の指定を忘れて自動判定に戻す
+    fn set_width(&mut self, width: u16) {
+        let wide = width >= MIN_WIDTH_FOR_PANEL;
+        if wide != self.wide {
+            self.wide = wide;
+            self.forced = None;
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.forced.unwrap_or(self.wide)
+    }
+
+    fn toggle(&mut self) {
+        self.forced = Some(!self.is_visible());
+    }
 }
 
 /// 画面を左（シェル）7 : 右（パネル）3 に分ける。パネルを隠しているときはシェルが全体を使う
@@ -201,7 +245,7 @@ fn take_toggle_keys(mut input: &[u8]) -> (Vec<u8>, usize) {
 
 /// 次の知らせを待つ。シェルが終了したら true を返す。
 /// 何も来なくても 50ms ごとに戻り、ウィンドウサイズの変化を拾えるようにしている
-fn wait_for_event(rx: &Receiver<AppEvent>, panel_visible: &mut bool) -> Result<bool> {
+fn wait_for_event(rx: &Receiver<AppEvent>, visibility: &mut PanelVisibility) -> Result<bool> {
     let first = match rx.recv_timeout(Duration::from_millis(50)) {
         Ok(event) => Some(event),
         Err(RecvTimeoutError::Timeout) => None,
@@ -211,7 +255,7 @@ fn wait_for_event(rx: &Receiver<AppEvent>, panel_visible: &mut bool) -> Result<b
     for event in first.into_iter().chain(rx.try_iter()) {
         match event {
             AppEvent::Output => {}
-            AppEvent::TogglePanel => *panel_visible = !*panel_visible,
+            AppEvent::TogglePanel => visibility.toggle(),
             AppEvent::Exited => return Ok(true),
         }
     }
