@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use globset::{GlobBuilder, GlobMatcher};
@@ -11,17 +13,32 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 /// 同じディレクトリでもこの間隔ごとに読み直す（ファイルの追加・削除を拾うため）
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// 別のディレクトリに切り替えるとき、読み込みをこの時間だけ待つ。
+/// 普通のディレクトリはこの間に読み終わるので、見出しの「…」がチラつかない。
+/// /mnt/c のような遅い場所でも、シェルの描画が止まるのはこの時間まで
+const SWITCH_WAIT: Duration = Duration::from_millis(20);
+
+/// 読み込み係から届く結果。どのディレクトリを読んだかと、中身またはエラーメッセージ
+type Loaded = (PathBuf, Result<Vec<Entry>, String>);
+
 pub struct FilePanel {
     /// シェルのプロセス番号。今いるディレクトリを調べるのに使う
     shell_pid: Option<u32>,
     /// シェルが今いるディレクトリ
     cwd: PathBuf,
-    /// パネルに表示しているディレクトリ。打ちかけのパスがあればその先、なければ cwd
+    /// 表示したいディレクトリ。打ちかけのパスがあればその先、なければ cwd
+    wanted: PathBuf,
+    /// entries を読んだディレクトリ。wanted の読み込みが終わるまでは前の場所のまま
     dir: PathBuf,
     entries: Vec<Entry>,
     /// 読み込みに失敗したときのメッセージ
     error: Option<String>,
     last_refresh: Instant,
+    /// 読み込み係への依頼と、その結果
+    load_tx: Sender<PathBuf>,
+    load_rx: Receiver<Loaded>,
+    /// 最後に依頼して、まだ結果が届いていないディレクトリ
+    pending: Option<PathBuf>,
     /// 最後に受け取ったコマンドライン。変わったときだけ glob を作り直す
     command_line: String,
     globs: Vec<GlobMatcher>,
@@ -37,20 +54,29 @@ struct Entry {
 }
 
 impl FilePanel {
-    pub fn new(shell_pid: Option<u32>, start_dir: PathBuf) -> Self {
-        let mut panel = Self {
+    /// on_loaded は読み込み係が結果を届けるたびに呼ばれる（描き直しの合図に使う）
+    pub fn new(
+        shell_pid: Option<u32>,
+        start_dir: PathBuf,
+        on_loaded: impl Fn() + Send + 'static,
+    ) -> Self {
+        let (load_tx, load_rx) = spawn_loader(on_loaded);
+        Self {
             shell_pid,
             cwd: start_dir.clone(),
-            dir: start_dir,
+            wanted: start_dir,
+            // まだ何も読んでいない。最初の update で読み込みを頼む
+            dir: PathBuf::new(),
             entries: Vec::new(),
             error: None,
             last_refresh: Instant::now(),
+            load_tx,
+            load_rx,
+            pending: None,
             command_line: String::new(),
             globs: Vec::new(),
             filter: String::new(),
-        };
-        panel.reload();
-        panel
+        }
     }
 
     /// シェルの現在地と入力中のコマンドラインから、表示するディレクトリ・絞り込み・ハイライトを決める。
@@ -59,20 +85,37 @@ impl FilePanel {
         if let Some(cwd) = self.shell_cwd() {
             self.cwd = cwd;
         }
-        let (dir, filter) = self.target(word);
-        self.filter = filter;
+        let (wanted, filter) = self.target(word);
+        self.wanted = wanted;
 
-        let dir_changed = dir != self.dir;
-        let line_changed = line != self.command_line;
-        self.dir = dir;
-        if dir_changed || line_changed {
-            self.command_line = line.to_string();
-            self.globs = parse_globs(line, &self.cwd, &self.dir);
+        // 読み終わった結果を受け取る
+        let mut reloaded = false;
+        while let Ok(loaded) = self.load_rx.try_recv() {
+            reloaded |= self.apply(loaded);
         }
 
-        if dir_changed || self.last_refresh.elapsed() >= REFRESH_INTERVAL {
-            self.reload();
-        } else if line_changed {
+        // 別の場所に切り替えるときと、同じ場所でも一定時間たったときは、読み込みを頼む
+        let switching = self.wanted != self.dir;
+        let stale = self.last_refresh.elapsed() >= REFRESH_INTERVAL;
+        if (switching || stale) && self.pending.as_ref() != Some(&self.wanted) {
+            self.pending = Some(self.wanted.clone());
+            let _ = self.load_tx.send(self.wanted.clone());
+            if switching && let Ok(loaded) = self.load_rx.recv_timeout(SWITCH_WAIT) {
+                reloaded |= self.apply(loaded);
+            }
+        }
+
+        // 絞り込みは wanted に対するものなので、まだ前の場所を表示している間はかけない
+        self.filter = if self.wanted == self.dir {
+            filter
+        } else {
+            String::new()
+        };
+
+        let line_changed = line != self.command_line;
+        if line_changed || reloaded {
+            self.command_line = line.to_string();
+            self.globs = parse_globs(line, &self.cwd, &self.dir);
             self.mark_matches();
         }
     }
@@ -128,19 +171,28 @@ impl FilePanel {
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
-    fn reload(&mut self) {
+    /// 読み込み係からの結果を反映する。今表示したい場所の結果だったら true
+    fn apply(&mut self, (dir, result): Loaded) -> bool {
+        if self.pending.as_ref() == Some(&dir) {
+            self.pending = None;
+        }
+        // 入力が進んで、もう表示したくない場所の結果は捨てる
+        if dir != self.wanted {
+            return false;
+        }
+        self.dir = dir;
         self.last_refresh = Instant::now();
-        match read_entries(&self.dir) {
+        match result {
             Ok(entries) => {
                 self.entries = entries;
                 self.error = None;
-                self.mark_matches();
             }
             Err(err) => {
                 self.entries.clear();
                 self.error = Some(format!("読み込めません: {err}"));
             }
         }
+        true
     }
 
     fn mark_matches(&mut self) {
@@ -152,16 +204,22 @@ impl FilePanel {
         }
     }
 
-    /// パネルの見出し。ディレクトリ名だけにし、シェルの現在地以外を先に見せているときは → を付ける
+    /// パネルの見出し。ディレクトリ名だけにし、シェルの現在地以外を先に見せているときは → を付ける。
+    /// 読み込みが終わるまでは前の場所の一覧のままなので、… を付けて読み込み中だと分かるようにする
     fn title(&self) -> String {
-        let name = match self.dir.file_name() {
+        let name = match self.wanted.file_name() {
             Some(name) => format!("{}/", name.to_string_lossy()),
-            None => self.dir.display().to_string(), // ルート "/" のとき
+            None => self.wanted.display().to_string(), // ルート "/" のとき
         };
-        if self.dir == self.cwd {
+        let name = if self.wanted == self.cwd {
             name
         } else {
             format!("→ {name}")
+        };
+        if self.wanted == self.dir {
+            name
+        } else {
+            format!("{name} …")
         }
     }
 }
@@ -196,14 +254,39 @@ impl Entry {
     }
 }
 
+/// 読み込み係のスレッドを立てる。/mnt/c のような遅い場所を読んでも、メインループが止まらないようにするため
+fn spawn_loader(on_loaded: impl Fn() + Send + 'static) -> (Sender<PathBuf>, Receiver<Loaded>) {
+    let (request_tx, request_rx) = mpsc::channel::<PathBuf>();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(mut dir) = request_rx.recv() {
+            // 読んでいる間に依頼が溜まっていたら、最新のものだけ読む
+            while let Ok(newer) = request_rx.try_recv() {
+                dir = newer;
+            }
+            let result = read_entries(&dir).map_err(|err| err.to_string());
+            if result_tx.send((dir, result)).is_err() {
+                return;
+            }
+            on_loaded();
+        }
+    });
+    (request_tx, result_rx)
+}
+
 /// ディレクトリの中身を読む。並び順は ディレクトリ → ファイル、その中で名前順（大文字小文字を区別しない）
 fn read_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
     let mut entries: Vec<Entry> = std::fs::read_dir(dir)?
         .filter_map(|entry| entry.ok())
         .map(|entry| Entry {
             name: entry.file_name().to_string_lossy().into_owned(),
-            // シンボリックリンクの先がディレクトリなら、ディレクトリとして扱う
-            is_dir: entry.path().is_dir(),
+            // 種類は read_dir の結果から分かるので、ファイルごとに調べ直さない（/mnt/c では特に遅い）。
+            // シンボリックリンクだけはリンク先を見て、ディレクトリならディレクトリとして扱う
+            is_dir: match entry.file_type() {
+                Ok(t) if t.is_symlink() => entry.path().is_dir(),
+                Ok(t) => t.is_dir(),
+                Err(_) => false,
+            },
             highlighted: false,
         })
         .collect();

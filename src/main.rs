@@ -56,7 +56,7 @@ const MIN_WIDTH_FOR_PANEL: u16 = MIN_SHELL_WIDTH + PANEL_WIDTH;
 
 /// 別スレッドからメインループに届く知らせ
 enum AppEvent {
-    /// シェルが何か出力した、またはスクロールした（画面を描き直す合図）
+    /// シェルが何か出力した、スクロールした、パネルの読み込みが終わった（画面を描き直す合図）
     Output,
     Exited,
     TogglePanel,
@@ -89,7 +89,13 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     drop(pair.slave);
     let master = pair.master;
 
-    let mut panel = FilePanel::new(child.process_id(), std::env::current_dir()?);
+    let (tx, rx) = mpsc::channel();
+
+    // パネルはディレクトリを別スレッドで読む。読み終わったら描き直しを頼む
+    let panel_tx = tx.clone();
+    let mut panel = FilePanel::new(child.process_id(), std::env::current_dir()?, move || {
+        let _ = panel_tx.send(AppEvent::Output);
+    });
 
     // シェルの出力を解釈して今の画面をメモリ上に持つ仮想端末
     let parser = Arc::new(Mutex::new(vt100::Parser::new(
@@ -98,7 +104,6 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         SCROLLBACK_LINES,
     )));
 
-    let (tx, rx) = mpsc::channel();
     spawn_output_thread(master.try_clone_reader()?, Arc::clone(&parser), tx.clone());
     spawn_input_thread(master.take_writer()?, Arc::clone(&parser), tx);
 
