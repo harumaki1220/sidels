@@ -99,6 +99,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "zsh".to_string());
     let mut cmd = CommandBuilder::new(shell);
     cmd.cwd(std::env::current_dir()?);
+    // sidels の中で動いていることをシェルに知らせる。
+    // .zshrc から sidels を自動起動するときに、中のシェルでまた起動して入れ子になるのを防ぐのに使える
+    cmd.env("SIDELS", "1");
     let mut child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
     let master = pair.master;
