@@ -5,6 +5,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::execute;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -43,6 +45,10 @@ const SPECIAL_KEYS: &[(&[u8], SpecialKey)] = &[
 /// Shift+↑ / Shift+↓ で一度に動かす行数
 const SCROLL_LINES: usize = 3;
 
+/// 貼り付けの開始・終了の印。外側のターミナルが貼り付けた文字をこれで囲んで送ってくる
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
 /// 左ペインの履歴として覚えておく行数
 const SCROLLBACK_LINES: usize = 10_000;
 
@@ -65,8 +71,16 @@ enum AppEvent {
 fn main() -> Result<()> {
     // rawモード + 別画面に切り替える。パニックしても自動で元に戻る
     let mut terminal = ratatui::init();
+    // 外側のターミナルに、貼り付けた文字を印で囲んで送ってもらう。
+    execute!(io::stdout(), EnableBracketedPaste)?;
+    let ratatui_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        ratatui_hook(info);
+    }));
     // run の中で ? によるエラーが起きても、必ず restore まで来る
     let result = run(&mut terminal);
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -297,8 +311,19 @@ fn spawn_input_thread(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     // vim などが別画面を使っている間は、スクロールのキーもアプリに渡す
-                    let can_scroll = !parser.lock().unwrap().screen().alternate_screen();
+                    let (can_scroll, app_wants_paste) = {
+                        let parser = parser.lock().unwrap();
+                        let screen = parser.screen();
+                        (!screen.alternate_screen(), screen.bracketed_paste())
+                    };
                     let (input, keys) = take_special_keys(&buf[..n], can_scroll);
+                    // 貼り付けの印は、中のアプリ（zsh など）が頼んでいるときだけ渡す。
+                    // 頼んでいないアプリに渡すと、印がそのまま文字として入ってしまう
+                    let input = if app_wants_paste {
+                        input
+                    } else {
+                        remove_all(&remove_all(&input, PASTE_START), PASTE_END)
+                    };
                     for key in keys {
                         let event = match key {
                             SpecialKey::TogglePanel => AppEvent::TogglePanel,
@@ -349,6 +374,21 @@ fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey
         i += 1;
     }
     (rest, keys)
+}
+
+/// input から needle をすべて取り除く
+fn remove_all(input: &[u8], needle: &[u8]) -> Vec<u8> {
+    let mut rest = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i..].starts_with(needle) {
+            i += needle.len();
+        } else {
+            rest.push(input[i]);
+            i += 1;
+        }
+    }
+    rest
 }
 
 /// 履歴をさかのぼる・進める。vt100 が履歴の範囲に収めてくれる
