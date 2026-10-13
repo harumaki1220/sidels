@@ -86,8 +86,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
         // 隠している間はディレクトリを読みに行かない
         if panel_visible {
-            panel.update();
-            panel.set_command_line(&cursor_line(&parser.lock().unwrap()));
+            let (line, word) = read_input(&parser.lock().unwrap());
+            panel.update(&line, &word);
         }
 
         terminal.draw(|frame| {
@@ -120,19 +120,41 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
-/// カーソルがある行の文字列。プロンプトも混ざるが、glob を探すだけなら問題ない。
+/// 画面から入力中の内容を読む。返すのは (カーソル行全体, カーソル直前の打ちかけの単語)。
+/// 行全体にはプロンプトも混ざるが、glob を探すだけなら問題ない。
+/// 単語はカーソルから左の空白までなので、プロンプトは混ざらない。
 /// vim などが別画面を使っている間は、シェルの入力ではないので空にする
-fn cursor_line(parser: &vt100::Parser) -> String {
+fn read_input(parser: &vt100::Parser) -> (String, String) {
     let screen = parser.screen();
     if screen.alternate_screen() {
-        return String::new();
+        return (String::new(), String::new());
     }
-    let (row, _) = screen.cursor_position();
+    let (row, col) = screen.cursor_position();
     let (_, cols) = screen.size();
-    screen
+    let line = screen
         .rows(0, cols)
         .nth(usize::from(row))
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    // vt100 は行末の空白を詰めて返すので、"vim " の直後かどうかはカーソルの左のセルで判断する
+    let after_space = col == 0
+        || screen
+            .cell(row, col - 1)
+            .is_none_or(|cell| cell.contents().trim().is_empty() && !cell.is_wide_continuation());
+    let word = if after_space {
+        String::new()
+    } else {
+        let before_cursor = screen
+            .rows(0, col)
+            .nth(usize::from(row))
+            .unwrap_or_default();
+        let word = before_cursor
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or_default();
+        word.to_string()
+    };
+    (line, word)
 }
 
 /// パネルを出すかどうか。普段は画面幅で自動で決め、F12 が押されたらそれに従う

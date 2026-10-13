@@ -14,6 +14,9 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 pub struct FilePanel {
     /// シェルのプロセス番号。今いるディレクトリを調べるのに使う
     shell_pid: Option<u32>,
+    /// シェルが今いるディレクトリ
+    cwd: PathBuf,
+    /// パネルに表示しているディレクトリ。打ちかけのパスがあればその先、なければ cwd
     dir: PathBuf,
     entries: Vec<Entry>,
     /// 読み込みに失敗したときのメッセージ
@@ -22,6 +25,8 @@ pub struct FilePanel {
     /// 最後に受け取ったコマンドライン。変わったときだけ glob を作り直す
     command_line: String,
     globs: Vec<GlobMatcher>,
+    /// 打ちかけの名前。これで始まるものだけを表示する
+    filter: String,
 }
 
 struct Entry {
@@ -35,39 +40,41 @@ impl FilePanel {
     pub fn new(shell_pid: Option<u32>, start_dir: PathBuf) -> Self {
         let mut panel = Self {
             shell_pid,
+            cwd: start_dir.clone(),
             dir: start_dir,
             entries: Vec::new(),
             error: None,
             last_refresh: Instant::now(),
             command_line: String::new(),
             globs: Vec::new(),
+            filter: String::new(),
         };
         panel.reload();
         panel
     }
 
-    /// シェルが cd していたら追従し、一定時間たっていたら読み直す
-    pub fn update(&mut self) {
-        if let Some(cwd) = self.shell_cwd()
-            && cwd != self.dir
-        {
-            self.dir = cwd;
-            self.reload();
-            return;
+    /// シェルの現在地と入力中のコマンドラインから、表示するディレクトリ・絞り込み・ハイライトを決める。
+    /// line はカーソル行全体、word はカーソル直前の打ちかけの単語
+    pub fn update(&mut self, line: &str, word: &str) {
+        if let Some(cwd) = self.shell_cwd() {
+            self.cwd = cwd;
         }
-        if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
-            self.reload();
-        }
-    }
+        let (dir, filter) = self.target(word);
+        self.filter = filter;
 
-    /// 入力中のコマンドラインを受け取り、その中の glob にマッチするファイルに印をつける
-    pub fn set_command_line(&mut self, line: &str) {
-        if line == self.command_line {
-            return;
+        let dir_changed = dir != self.dir;
+        let line_changed = line != self.command_line;
+        self.dir = dir;
+        if dir_changed || line_changed {
+            self.command_line = line.to_string();
+            self.globs = parse_globs(line, &self.cwd, &self.dir);
         }
-        self.command_line = line.to_string();
-        self.globs = parse_globs(line);
-        self.mark_matches();
+
+        if dir_changed || self.last_refresh.elapsed() >= REFRESH_INTERVAL {
+            self.reload();
+        } else if line_changed {
+            self.mark_matches();
+        }
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -80,10 +87,39 @@ impl FilePanel {
                 message.clone(),
                 Style::default().fg(Color::Red),
             ))],
-            None => self.entries.iter().map(Entry::to_list_item).collect(),
+            None => self.visible_entries().map(Entry::to_list_item).collect(),
         };
 
         frame.render_widget(List::new(items).block(block), area);
+    }
+
+    /// 打ちかけの単語が「ディレクトリ/名前の途中」なら、そのディレクトリと名前の途中を返す。
+    /// そうでなければ cwd と単語そのもの。glob を打っているときは絞り込まない（ハイライトに任せる）
+    fn target(&self, word: &str) -> (PathBuf, String) {
+        let (dir, name) = match word.rfind('/') {
+            Some(i) => match resolve_dir(&self.cwd, &word[..=i]) {
+                Some(dir) => (dir, &word[i + 1..]),
+                // 存在しないディレクトリを打っている途中は、いつもの表示に戻す
+                None => return (self.cwd.clone(), String::new()),
+            },
+            None => (self.cwd.clone(), word),
+        };
+        if is_glob(name) {
+            (dir, String::new())
+        } else {
+            (dir, name.to_string())
+        }
+    }
+
+    /// 絞り込み後の一覧。何も残らないときは全部出す（コマンド名を打っている間に一覧が空にならないように）
+    fn visible_entries(&self) -> impl Iterator<Item = &Entry> {
+        let any_match = self
+            .entries
+            .iter()
+            .any(|e| e.name.starts_with(&self.filter));
+        self.entries
+            .iter()
+            .filter(move |e| !any_match || e.name.starts_with(&self.filter))
     }
 
     /// Linux では /proc/<pid>/cwd がそのプロセスが今いるディレクトリへのリンクになっている
@@ -116,11 +152,16 @@ impl FilePanel {
         }
     }
 
-    /// パネルの見出し。ディレクトリ名だけにする
+    /// パネルの見出し。ディレクトリ名だけにし、シェルの現在地以外を先に見せているときは → を付ける
     fn title(&self) -> String {
-        match self.dir.file_name() {
+        let name = match self.dir.file_name() {
             Some(name) => format!("{}/", name.to_string_lossy()),
             None => self.dir.display().to_string(), // ルート "/" のとき
+        };
+        if self.dir == self.cwd {
+            name
+        } else {
+            format!("→ {name}")
         }
     }
 }
@@ -176,14 +217,39 @@ fn read_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// コマンドラインから glob らしい単語を取り出す。
-/// 引用符やバックスラッシュ付きのものはシェルが展開しないので除く。
-/// / を含むものはパネルに出ていない別のディレクトリを指すので、今は扱わない
-fn parse_globs(line: &str) -> Vec<GlobMatcher> {
+fn is_glob(word: &str) -> bool {
+    word.contains(['*', '?', '['])
+}
+
+/// "src/" や "~/foo/" のような打ちかけのディレクトリ部分を、実在するディレクトリのパスにする
+fn resolve_dir(cwd: &Path, dir: &str) -> Option<PathBuf> {
+    let path = match dir.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => cwd.join(dir), // dir が / で始まるなら join はそちらを使う
+    };
+    path.is_dir().then_some(path)
+}
+
+/// コマンドラインから、表示中のディレクトリ dir を対象とする glob を取り出す。
+/// "*.log" は cwd、"src/*.rs" は cwd/src を対象とする。
+/// 引用符やバックスラッシュ付きのものはシェルが展開しないので除く
+fn parse_globs(line: &str, cwd: &Path, dir: &Path) -> Vec<GlobMatcher> {
     line.split_whitespace()
-        .filter(|word| word.contains(['*', '?', '[']))
-        .filter(|word| !word.contains(['/', '\\', '\'', '"']))
-        .filter_map(|word| GlobBuilder::new(word).literal_separator(true).build().ok())
+        .filter(|word| is_glob(word))
+        .filter(|word| !word.contains(['\\', '\'', '"']))
+        .filter_map(|word| {
+            let (word_dir, pattern) = match word.rfind('/') {
+                Some(i) => (resolve_dir(cwd, &word[..=i])?, &word[i + 1..]),
+                None => (cwd.to_path_buf(), word),
+            };
+            (word_dir == dir).then_some(pattern)
+        })
+        .filter_map(|pattern| {
+            GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .ok()
+        })
         .map(|glob| glob.compile_matcher())
         .collect()
 }
