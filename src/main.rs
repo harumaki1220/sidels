@@ -13,8 +13,38 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 mod panel;
 use panel::FilePanel;
 
-/// パネルを出し入れするキー（F12）。端末からはこのバイト列で届く
-const TOGGLE_PANEL_KEY: &[u8] = b"\x1b[24~";
+/// sidels が横取りするキー。端末からはこのバイト列で届く
+#[derive(Clone, Copy)]
+enum SpecialKey {
+    /// F12: パネルの出し入れ
+    TogglePanel,
+    /// 左ペインの履歴をスクロールする
+    Scroll(ScrollStep),
+}
+
+#[derive(Clone, Copy)]
+enum ScrollStep {
+    /// Shift+PageUp / Shift+PageDown: 半画面ずつ
+    HalfPageUp,
+    HalfPageDown,
+    /// Shift+↑ / Shift+↓: SCROLL_LINES 行ずつ（PageUp が押しにくいキーボード向け）
+    LinesUp,
+    LinesDown,
+}
+
+const SPECIAL_KEYS: &[(&[u8], SpecialKey)] = &[
+    (b"\x1b[24~", SpecialKey::TogglePanel),
+    (b"\x1b[5;2~", SpecialKey::Scroll(ScrollStep::HalfPageUp)),
+    (b"\x1b[6;2~", SpecialKey::Scroll(ScrollStep::HalfPageDown)),
+    (b"\x1b[1;2A", SpecialKey::Scroll(ScrollStep::LinesUp)),
+    (b"\x1b[1;2B", SpecialKey::Scroll(ScrollStep::LinesDown)),
+];
+
+/// Shift+↑ / Shift+↓ で一度に動かす行数
+const SCROLL_LINES: usize = 3;
+
+/// 左ペインの履歴として覚えておく行数
+const SCROLLBACK_LINES: usize = 10_000;
 
 /// パネルの幅（左の区切り線を含む）
 const PANEL_WIDTH: u16 = 28;
@@ -26,7 +56,7 @@ const MIN_WIDTH_FOR_PANEL: u16 = MIN_SHELL_WIDTH + PANEL_WIDTH;
 
 /// 別スレッドからメインループに届く知らせ
 enum AppEvent {
-    /// シェルが何か出力した（画面を描き直す合図）
+    /// シェルが何か出力した、またはスクロールした（画面を描き直す合図）
     Output,
     Exited,
     TogglePanel,
@@ -65,12 +95,12 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let parser = Arc::new(Mutex::new(vt100::Parser::new(
         pty_size.rows,
         pty_size.cols,
-        0,
+        SCROLLBACK_LINES,
     )));
 
     let (tx, rx) = mpsc::channel();
     spawn_output_thread(master.try_clone_reader()?, Arc::clone(&parser), tx.clone());
-    spawn_input_thread(master.take_writer()?, tx);
+    spawn_input_thread(master.take_writer()?, Arc::clone(&parser), tx);
 
     loop {
         // ウィンドウの大きさが変わっていたら、PTYと仮想端末も合わせる
@@ -84,8 +114,10 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             pty_size = new_size;
         }
 
-        // 隠している間はディレクトリを読みに行かない
-        if panel_visible {
+        // 隠している間はディレクトリを読みに行かない。
+        // 履歴をさかのぼっている間は画面に入力中の行が映っていないので、パネルは直前のまま
+        let scrolled = parser.lock().unwrap().screen().scrollback() > 0;
+        if panel_visible && !scrolled {
             let (line, word) = read_input(&parser.lock().unwrap());
             panel.update(&line, &word);
         }
@@ -101,7 +133,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             let shell_view =
                 PseudoTerminal::new(screen).cursor(Cursor::default().visibility(false));
             frame.render_widget(shell_view, left);
-            if !screen.hide_cursor() {
+            // 履歴をさかのぼっている間は、カーソルの位置に意味がないので隠す
+            if !screen.hide_cursor() && screen.scrollback() == 0 {
                 let (row, col) = screen.cursor_position();
                 frame.set_cursor_position((left.x + col, left.y + row));
             }
@@ -245,8 +278,12 @@ fn spawn_output_thread(
     });
 }
 
-/// キーボード → シェル。パネルの出し入れキーだけは抜き取ってメインループに知らせる
-fn spawn_input_thread(mut writer: Box<dyn Write + Send>, tx: Sender<AppEvent>) {
+/// キーボード → シェル。sidels のキーだけは抜き取って自分で処理する
+fn spawn_input_thread(
+    mut writer: Box<dyn Write + Send>,
+    parser: Arc<Mutex<vt100::Parser>>,
+    tx: Sender<AppEvent>,
+) {
     thread::spawn(move || {
         let mut stdin = io::stdin();
         let mut buf = [0u8; 1024];
@@ -254,15 +291,31 @@ fn spawn_input_thread(mut writer: Box<dyn Write + Send>, tx: Sender<AppEvent>) {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let (input, toggles) = take_toggle_keys(&buf[..n]);
-                    for _ in 0..toggles {
-                        if tx.send(AppEvent::TogglePanel).is_err() {
+                    // vim などが別画面を使っている間は、スクロールのキーもアプリに渡す
+                    let can_scroll = !parser.lock().unwrap().screen().alternate_screen();
+                    let (input, keys) = take_special_keys(&buf[..n], can_scroll);
+                    for key in keys {
+                        let event = match key {
+                            SpecialKey::TogglePanel => AppEvent::TogglePanel,
+                            SpecialKey::Scroll(step) => {
+                                scroll(&parser, step);
+                                AppEvent::Output
+                            }
+                        };
+                        if tx.send(event).is_err() {
                             return;
                         }
                     }
                     if input.is_empty() {
                         continue;
                     }
+                    // 普通のターミナルと同じく、何か打ったら最新の画面に戻る
+                    let mut parser_guard = parser.lock().unwrap();
+                    if parser_guard.screen().scrollback() > 0 {
+                        parser_guard.screen_mut().set_scrollback(0);
+                        let _ = tx.send(AppEvent::Output);
+                    }
+                    drop(parser_guard);
                     if writer.write_all(&input).is_err() || writer.flush().is_err() {
                         break;
                     }
@@ -272,20 +325,40 @@ fn spawn_input_thread(mut writer: Box<dyn Write + Send>, tx: Sender<AppEvent>) {
     });
 }
 
-/// 入力から出し入れキーを取り除き、残りのバイト列と押された回数を返す
-fn take_toggle_keys(mut input: &[u8]) -> (Vec<u8>, usize) {
+/// 入力から sidels のキーを取り除き、残りのバイト列と押されたキーを返す。
+/// can_scroll が false ならスクロールのキーは取り除かない
+fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey>) {
     let mut rest = Vec::with_capacity(input.len());
-    let mut toggles = 0;
-    while let Some(pos) = input
-        .windows(TOGGLE_PANEL_KEY.len())
-        .position(|w| w == TOGGLE_PANEL_KEY)
-    {
-        rest.extend_from_slice(&input[..pos]);
-        toggles += 1;
-        input = &input[pos + TOGGLE_PANEL_KEY.len()..];
+    let mut keys = Vec::new();
+    let mut i = 0;
+    'outer: while i < input.len() {
+        for &(seq, key) in SPECIAL_KEYS {
+            let is_scroll = matches!(key, SpecialKey::Scroll(_));
+            if input[i..].starts_with(seq) && (can_scroll || !is_scroll) {
+                keys.push(key);
+                i += seq.len();
+                continue 'outer;
+            }
+        }
+        rest.push(input[i]);
+        i += 1;
     }
-    rest.extend_from_slice(input);
-    (rest, toggles)
+    (rest, keys)
+}
+
+/// 履歴をさかのぼる・進める。vt100 が履歴の範囲に収めてくれる
+fn scroll(parser: &Mutex<vt100::Parser>, step: ScrollStep) {
+    let mut parser = parser.lock().unwrap();
+    let screen = parser.screen_mut();
+    let half_page = usize::from(screen.size().0 / 2).max(1);
+    let offset = screen.scrollback();
+    let offset = match step {
+        ScrollStep::HalfPageUp => offset + half_page,
+        ScrollStep::HalfPageDown => offset.saturating_sub(half_page),
+        ScrollStep::LinesUp => offset + SCROLL_LINES,
+        ScrollStep::LinesDown => offset.saturating_sub(SCROLL_LINES),
+    };
+    screen.set_scrollback(offset);
 }
 
 /// 次の知らせを待つ。シェルが終了したら true を返す。
