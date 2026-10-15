@@ -1,4 +1,6 @@
-//! 入力係: キーボード・マウス → シェル。sidels のキー（パネルの出し入れ・スクロール）、マウス操作、貼り付けの印を処理する
+//! 入力係: キーボードとマウスの入力をシェルに渡す。
+//!
+//! sidels のキー（パネルの出し入れ・スクロール）、マウス操作、貼り付けの印はここで処理する。
 
 use std::io::{self, Read, Write};
 use std::sync::mpsc::Sender;
@@ -9,24 +11,28 @@ use crate::AppEvent;
 use crate::mouse::{self, MouseEvent};
 use crate::selection::{Selection, SharedSelection};
 
-/// sidels が横取りするキー。端末からはこのバイト列で届く
+/// sidels が横取りするキー。
+///
+/// 端末からは [`SPECIAL_KEYS`] のバイト列で届く。
 #[derive(Clone, Copy)]
 enum SpecialKey {
-    /// F12: パネルの出し入れ
+    /// F12: パネルの出し入れ。
     TogglePanel,
-    /// 左ペインの履歴をスクロールする
+    /// 左ペインの履歴をスクロールする。
     Scroll(ScrollStep),
-    /// マウス操作（sidels が外側のターミナルに頼んで送ってもらっている）
+    /// マウス操作（sidels が外側のターミナルに頼んで送ってもらっている）。
     Mouse(MouseEvent),
 }
 
 #[derive(Clone, Copy)]
 enum ScrollStep {
-    /// Shift+PageUp / Shift+PageDown: 半画面ずつ
+    /// Shift+PageUp: 半画面さかのぼる。
     HalfPageUp,
+    /// Shift+PageDown: 半画面進む。
     HalfPageDown,
-    /// Shift+↑ / Shift+↓: SCROLL_LINES 行ずつ（PageUp が押しにくいキーボード向け）
+    /// Shift+↑: [`SCROLL_LINES`] 行さかのぼる（PageUp が押しにくいキーボード向け）。
     LinesUp,
+    /// Shift+↓: [`SCROLL_LINES`] 行進む。
     LinesDown,
 }
 
@@ -38,14 +44,19 @@ const SPECIAL_KEYS: &[(&[u8], SpecialKey)] = &[
     (b"\x1b[1;2B", SpecialKey::Scroll(ScrollStep::LinesDown)),
 ];
 
-/// Shift+↑ / Shift+↓ で一度に動かす行数
+/// Shift+↑ / Shift+↓ やホイールで一度に動かす行数。
 const SCROLL_LINES: usize = 3;
 
-/// 貼り付けの開始・終了の印。外側のターミナルが貼り付けた文字をこれで囲んで送ってくる
+/// 貼り付けの開始の印。
+///
+/// 外側のターミナルは、貼り付けた文字を [`PASTE_START`] と [`PASTE_END`] で囲んで送ってくる。
 const PASTE_START: &[u8] = b"\x1b[200~";
+/// 貼り付けの終わりの印。
 const PASTE_END: &[u8] = b"\x1b[201~";
 
-/// キーボード → シェル。sidels のキーだけは抜き取って自分で処理する
+/// 入力係のスレッドを立てる。
+///
+/// キーボードとマウスの入力をシェルに渡す。sidels のキーとマウス操作だけは抜き取って自分で処理する。
 pub fn spawn_input_thread(
     mut writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
@@ -89,7 +100,7 @@ pub fn spawn_input_thread(
                                 AppEvent::Output
                             }
                             SpecialKey::Mouse(event) => {
-                                match handle_mouse(&event, &parser, &selection, &mut writer) {
+                                match handle_mouse(event, &parser, &selection, &mut writer) {
                                     Some(event) => event,
                                     None => continue,
                                 }
@@ -102,7 +113,6 @@ pub fn spawn_input_thread(
                     if input.is_empty() {
                         continue;
                     }
-                    // 何か打ったら選択を外す
                     if clear_selection(&selection) {
                         let _ = tx.send(AppEvent::Output);
                     }
@@ -123,7 +133,8 @@ pub fn spawn_input_thread(
 }
 
 /// 入力から sidels のキーを取り除き、残りのバイト列と押されたキーを返す。
-/// can_scroll が false ならスクロールのキーは取り除かない
+///
+/// `can_scroll` が `false` なら、スクロールのキーは取り除かずにアプリへ渡す。
 fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey>) {
     let mut rest = Vec::with_capacity(input.len());
     let mut keys = Vec::new();
@@ -149,13 +160,17 @@ fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey
     (rest, keys)
 }
 
-/// マウス操作を振り分ける。描き直しが必要なら知らせを返す
-/// - シェル側の外（パネルの上）: 今は何もしない
-/// - 中のアプリがマウスを頼んでいる（vim や htop など）: アプリが頼んだ形式で渡す。
+/// マウス操作を振り分ける。
+///
+/// 描き直しが必要なら、メインループへの知らせを返す。
+///
+/// - 中のアプリがマウスを頼んでいる（vim や htop など）: シェル側の操作だけ、アプリが頼んだ形式で渡す。
 ///   シェル側は画面の左上にあるので、座標はそのままでよい
+/// - 左ボタン: シェル側の文字を選択する
 /// - ホイール: 別画面（less など）なら ↑↓ キーとして渡し、普段は履歴をスクロールする
+/// - パネルの上でのそれ以外の操作: 何もしない
 fn handle_mouse(
-    event: &MouseEvent,
+    event: MouseEvent,
     parser: &Mutex<vt100::Parser>,
     selection: &Mutex<Option<Selection>>,
     writer: &mut Box<dyn Write + Send>,
@@ -218,10 +233,12 @@ fn handle_mouse(
     Some(AppEvent::Output)
 }
 
-/// 左ボタンでの選択。押すと始まり、ドラッグで広げ、離したら選んだ文字をコピーする。
-/// 何も選ばずに離した（クリックしただけ）なら選択を外す
+/// 左ボタンでの選択。
+///
+/// 押すと始まり、ドラッグで広げ、離したら選んだ文字をコピーする。
+/// 何も選ばずに離した（クリックしただけ）なら選択を外す。
 fn handle_selection(
-    event: &MouseEvent,
+    event: MouseEvent,
     in_shell: bool,
     pos: (u16, u16),
     parser: &Mutex<vt100::Parser>,
@@ -250,12 +267,13 @@ fn handle_selection(
     Some(AppEvent::Copy(text))
 }
 
-/// 選択を外す。外したら true
+/// 選択を外す。
+///
+/// 選択していて外したなら `true`（描き直しが必要）。
 fn clear_selection(selection: &Mutex<Option<Selection>>) -> bool {
     selection.lock().unwrap().take().is_some()
 }
 
-/// input から needle をすべて取り除く
 fn remove_all(input: &[u8], needle: &[u8]) -> Vec<u8> {
     let mut rest = Vec::with_capacity(input.len());
     let mut i = 0;
@@ -270,7 +288,9 @@ fn remove_all(input: &[u8], needle: &[u8]) -> Vec<u8> {
     rest
 }
 
-/// 履歴をさかのぼる・進める。vt100 が履歴の範囲に収めてくれる
+/// 履歴をさかのぼる・進める。
+///
+/// 履歴の範囲を超えないようにするのは vt100 がやってくれる。
 fn scroll(parser: &Mutex<vt100::Parser>, step: ScrollStep) {
     let mut parser = parser.lock().unwrap();
     let screen = parser.screen_mut();

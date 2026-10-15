@@ -1,46 +1,56 @@
-//! マウス: 外側のターミナルから届くマウス操作（SGR 形式）を読み、中のアプリが頼んだ形式で書き出す
+//! マウス操作の読み取りと書き出し。
+//!
+//! 外側のターミナルから届くマウス操作（SGR 形式）を読み、中のアプリが頼んだ形式で書き出す。
 
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-/// 外側のターミナルにマウス操作を送ってもらう。
-/// 1002: 押す・離す・押したままの移動（ドラッグ）、1006: SGR 形式（座標の大きさに制限がない）
+/// 外側のターミナルにマウス操作を送ってもらうための制御文字列。
+///
+/// 1002 は押す・離す・押したままの移動（ドラッグ）、1006 は SGR 形式（座標の大きさに制限がない）。
 pub const ENABLE: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+/// [`ENABLE`] で頼んだマウス操作の送信をやめてもらう。
 pub const DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1002l";
 
 const SGR_PREFIX: &[u8] = b"\x1b[<";
 
-/// 届いたマウス操作。座標は 1 始まり
+/// 外側のターミナルから届いたマウス操作。
 #[derive(Clone, Copy)]
 pub struct MouseEvent {
-    /// ボタンと修飾キーを表す番号（SGR 形式の値そのまま）
+    /// ボタンと修飾キーを表す番号（SGR 形式の値そのまま）。
     pub code: u16,
+    /// 列（1 始まり）。
     pub col: u16,
+    /// 行（1 始まり）。
     pub row: u16,
-    /// 押した（または動かした）なら true、離したなら false
+    /// 押した（または押したまま動かした）なら `true`、離したなら `false`。
     pub pressed: bool,
 }
 
 impl MouseEvent {
-    pub fn is_wheel(&self) -> bool {
+    /// ホイールを回した。
+    pub fn is_wheel(self) -> bool {
         self.code & 64 != 0
     }
 
-    pub fn is_wheel_up(&self) -> bool {
+    /// ホイールを上に回した。
+    pub fn is_wheel_up(self) -> bool {
         self.is_wheel() && self.code & 1 == 0
     }
 
-    /// ボタンを押したまま動かした（ドラッグ中）
-    pub fn is_motion(&self) -> bool {
+    /// ボタンを押したまま動かした（ドラッグ中）。
+    pub fn is_motion(self) -> bool {
         self.code & 32 != 0
     }
 
-    /// 左ボタンの操作（押す・ドラッグ・離す）
-    pub fn is_left(&self) -> bool {
+    /// 左ボタンの操作（押す・ドラッグ・離す）。
+    pub fn is_left(self) -> bool {
         !self.is_wheel() && self.code & 3 == 0
     }
 }
 
-/// 入力の先頭が SGR 形式のマウス操作（`ESC [ < 番号 ; 列 ; 行 M/m`）なら、それと長さを返す
+/// 入力の先頭が SGR 形式のマウス操作なら、それと長さを返す。
+///
+/// SGR 形式は `ESC [ < 番号 ; 列 ; 行 M`（押した）または `m`（離した）。
 pub fn parse_sgr(input: &[u8]) -> Option<(MouseEvent, usize)> {
     let rest = input.strip_prefix(SGR_PREFIX)?;
     let end = rest.iter().position(|&b| b == b'M' || b == b'm')?;
@@ -61,9 +71,11 @@ pub fn parse_sgr(input: &[u8]) -> Option<(MouseEvent, usize)> {
     Some((event, SGR_PREFIX.len() + end + 1))
 }
 
-/// 中のアプリ（vim など）が頼んだ種類・形式でマウス操作を書き出す。頼まれていない種類なら None
+/// 中のアプリ（vim など）が頼んだ種類・形式でマウス操作を書き出す。
+///
+/// 頼まれていない種類の操作（押すだけを頼まれているときの「離した」など）なら `None`。
 pub fn encode_for_app(
-    event: &MouseEvent,
+    event: MouseEvent,
     mode: MouseProtocolMode,
     encoding: MouseProtocolEncoding,
 ) -> Option<Vec<u8>> {
@@ -99,10 +111,13 @@ pub fn encode_for_app(
     Some(out)
 }
 
-/// 入力の最後が途中で切れたマウス操作（`ESC [ <` の後に数字と `;` だけ）なら、その始まりの位置を返す。
-/// 切れていなければ入力の長さを返す。ドラッグ中は操作が大量に届くので、読み込みの区切り目で切れることがある。
-/// `ESC` や `ESC [` だけで終わっている場合は取っておかない。Esc キーや Alt+[ を押しただけの可能性があり、
-/// 取っておくと次のキーを押すまでシェルに届かなくなる（vim で Esc が効かなくなる）
+/// 入力の最後で途中まで届いているマウス操作の、始まりの位置を返す。
+///
+/// 途中で切れていなければ入力の長さを返す。途中で切れているとは、`ESC [ <` の後に数字と `;` しかない状態。
+/// ドラッグ中は操作が大量に届くので、読み込みの区切り目で切れることがある。
+///
+/// `ESC` や `ESC [` だけで終わっている場合は途中とみなさない。Esc キーや Alt+[ を押しただけの可能性があり、
+/// 取っておくと次のキーを押すまでシェルに届かなくなる（vim で Esc が効かなくなる）。
 pub fn incomplete_tail_start(input: &[u8]) -> usize {
     let Some(start) = input.iter().rposition(|&b| b == 0x1b) else {
         return input.len();

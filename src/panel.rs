@@ -1,3 +1,8 @@
+//! 右側のファイル一覧パネル。
+//!
+//! シェルの現在地の中身を表示し、入力中のコマンドラインに合わせて
+//! 移動先のプレビュー・絞り込み・glob ハイライトを行う。
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -10,51 +15,67 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem};
 
-/// 同じディレクトリでもこの間隔ごとに読み直す（ファイルの追加・削除を拾うため）
+/// 同じディレクトリを読み直す間隔。
+///
+/// ファイルの追加・削除を拾うため、場所が変わらなくても読み直す。
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// 別のディレクトリに切り替えるとき、読み込みをこの時間だけ待つ。
+/// 別のディレクトリに切り替えるとき、読み込みを待つ時間。
+///
 /// 普通のディレクトリはこの間に読み終わるので、見出しの「…」がチラつかない。
-/// /mnt/c のような遅い場所でも、シェルの描画が止まるのはこの時間まで
+/// /mnt/c のような遅い場所でも、シェルの描画が止まるのはこの時間まで。
 const SWITCH_WAIT: Duration = Duration::from_millis(20);
 
-/// 読み込み係から届く結果。どのディレクトリを読んだかと、中身またはエラーメッセージ
+/// 読み込み係から届く結果。
+///
+/// どのディレクトリを読んだかと、中身またはエラーメッセージ。
 type Loaded = (PathBuf, Result<Vec<Entry>, String>);
 
+/// 右側のファイル一覧パネル。
 pub struct FilePanel {
-    /// シェルのプロセス番号。今いるディレクトリを調べるのに使う
+    /// シェルのプロセス番号。今いるディレクトリを調べるのに使う。
     shell_pid: Option<u32>,
-    /// シェルが今いるディレクトリ
+    /// シェルが今いるディレクトリ。
     cwd: PathBuf,
-    /// 表示したいディレクトリ。打ちかけのパスがあればその先、なければ cwd
+    /// 表示したいディレクトリ。打ちかけのパスがあればその先、なければ `cwd`。
     wanted: PathBuf,
-    /// entries を読んだディレクトリ。wanted の読み込みが終わるまでは前の場所のまま
+    /// `entries` を読んだディレクトリ。`wanted` の読み込みが終わるまでは前の場所のまま。
     dir: PathBuf,
+    /// `dir` の中身。
     entries: Vec<Entry>,
-    /// 読み込みに失敗したときのメッセージ
+    /// 読み込みに失敗したときのメッセージ。
     error: Option<String>,
+    /// 最後に読み込み結果を受け取った時刻。
     last_refresh: Instant,
-    /// 読み込み係への依頼と、その結果
+    /// 読み込み係への依頼。
     load_tx: Sender<PathBuf>,
+    /// 読み込み係からの結果。
     load_rx: Receiver<Loaded>,
-    /// 最後に依頼して、まだ結果が届いていないディレクトリ
+    /// 最後に依頼して、まだ結果が届いていないディレクトリ。
     pending: Option<PathBuf>,
-    /// 最後に受け取ったコマンドライン。変わったときだけ glob を作り直す
+    /// 最後に受け取ったコマンドライン。変わったときだけ glob を作り直す。
     command_line: String,
+    /// コマンドライン中の glob のうち、`dir` を対象とするもの。
     globs: Vec<GlobMatcher>,
-    /// 打ちかけの名前。これで始まるものだけを表示する
+    /// 打ちかけの名前。これで始まるものだけを表示する。
     filter: String,
 }
 
+/// パネルの 1 行（ファイルまたはディレクトリ）。
 struct Entry {
+    /// ファイル名。
     name: String,
+    /// ディレクトリ（またはディレクトリへのシンボリックリンク）。
     is_dir: bool,
-    /// コマンドライン中の glob にマッチしている
+    /// コマンドライン中の glob にマッチしている。
     highlighted: bool,
 }
 
 impl FilePanel {
-    /// on_loaded は読み込み係が結果を届けるたびに呼ばれる（メインループを起こして update を呼んでもらう合図に使う）
+    /// パネルを作り、読み込み係のスレッドを立てる。
+    ///
+    /// `on_loaded` は読み込み係が結果を届けるたびに呼ばれる。
+    /// メインループを起こして [`FilePanel::update`] を呼んでもらう合図に使う。
     pub fn new(
         shell_pid: Option<u32>,
         start_dir: PathBuf,
@@ -80,8 +101,9 @@ impl FilePanel {
     }
 
     /// シェルの現在地と入力中のコマンドラインから、表示するディレクトリ・絞り込み・ハイライトを決める。
-    /// line はカーソル行全体、word はカーソル直前の打ちかけの単語
-    /// 表示が変わったら true を返す（変わっていなければ描き直さなくてよい）
+    ///
+    /// `line` はカーソル行全体、`word` はカーソル直前の打ちかけの単語。
+    /// 表示が変わったら `true` を返す（変わっていなければ描き直さなくてよい）。
     pub fn update(&mut self, line: &str, word: &str) -> bool {
         let title_before = self.title();
         let filter_before = self.filter.clone();
@@ -93,7 +115,6 @@ impl FilePanel {
         let (wanted, filter) = self.target(word);
         self.wanted = wanted;
 
-        // 読み終わった結果を受け取る
         let mut reloaded = false;
         while let Ok(loaded) = self.load_rx.try_recv() {
             let (accepted, changed) = self.apply(loaded);
@@ -134,6 +155,7 @@ impl FilePanel {
             || self.title() != title_before
     }
 
+    /// パネルを `area` に描く。
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::LEFT)
@@ -150,8 +172,10 @@ impl FilePanel {
         frame.render_widget(List::new(items).block(block), area);
     }
 
-    /// 打ちかけの単語が「ディレクトリ/名前の途中」なら、そのディレクトリと名前の途中を返す。
-    /// そうでなければ cwd と単語そのもの。glob を打っているときは絞り込まない（ハイライトに任せる）
+    /// 打ちかけの単語から、表示するディレクトリと絞り込みに使う名前を決める。
+    ///
+    /// 単語が「ディレクトリ/名前の途中」なら、そのディレクトリと名前の途中を返す。
+    /// そうでなければ `cwd` と単語そのもの。glob を打っているときは絞り込まない（ハイライトに任せる）。
     fn target(&self, word: &str) -> (PathBuf, String) {
         let (dir, name) = match word.rfind('/') {
             Some(i) => match resolve_dir(&self.cwd, &word[..=i]) {
@@ -168,7 +192,9 @@ impl FilePanel {
         }
     }
 
-    /// 絞り込み後の一覧。何も残らないときは全部出す（コマンド名を打っている間に一覧が空にならないように）
+    /// 絞り込み後の一覧。
+    ///
+    /// 何も残らないときは全部出す（コマンド名を打っている間に一覧が空にならないように）。
     fn visible_entries(&self) -> impl Iterator<Item = &Entry> {
         let any_match = self
             .entries
@@ -179,14 +205,18 @@ impl FilePanel {
             .filter(move |e| !any_match || e.name.starts_with(&self.filter))
     }
 
-    /// Linux では /proc/<pid>/cwd がそのプロセスが今いるディレクトリへのリンクになっている
+    /// シェルが今いるディレクトリ。
+    ///
+    /// Linux では `/proc/<pid>/cwd` が、そのプロセスが今いるディレクトリへのリンクになっている。
     fn shell_cwd(&self) -> Option<PathBuf> {
         let pid = self.shell_pid?;
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
-    /// 読み込み係からの結果を反映する。返すのは (今表示したい場所の結果だったか, 一覧の中身が変わったか)。
-    /// 1 秒ごとの読み直しで中身が同じなら描き直さなくてよいので、変わったかどうかを分けて返す
+    /// 読み込み係からの結果を反映する。
+    ///
+    /// 返すのは `(今表示したい場所の結果だったか, 一覧の中身が変わったか)`。
+    /// 1 秒ごとの読み直しで中身が同じなら描き直さなくてよいので、変わったかどうかを分けて返す。
     fn apply(&mut self, (dir, result): Loaded) -> (bool, bool) {
         if self.pending.as_ref() == Some(&dir) {
             self.pending = None;
@@ -208,6 +238,7 @@ impl FilePanel {
         (true, changed)
     }
 
+    /// 各ファイルが glob にマッチするかを付け直す。
     fn mark_matches(&mut self) {
         for entry in &mut self.entries {
             entry.highlighted = self
@@ -217,8 +248,10 @@ impl FilePanel {
         }
     }
 
-    /// パネルの見出し。ディレクトリ名だけにし、シェルの現在地以外を先に見せているときは → を付ける。
-    /// 読み込みが終わるまでは前の場所の一覧のままなので、… を付けて読み込み中だと分かるようにする
+    /// パネルの見出し。
+    ///
+    /// ディレクトリ名だけにし、シェルの現在地以外を先に見せているときは → を付ける。
+    /// 読み込みが終わるまでは前の場所の一覧のままなので、… を付けて読み込み中だと分かるようにする。
     fn title(&self) -> String {
         let name = match self.wanted.file_name() {
             Some(name) => format!("{}/", name.to_string_lossy()),
@@ -267,7 +300,9 @@ impl Entry {
     }
 }
 
-/// 読み込み係のスレッドを立てる。/mnt/c のような遅い場所を読んでも、メインループが止まらないようにするため
+/// 読み込み係のスレッドを立てる。
+///
+/// /mnt/c のような遅い場所を読んでも、メインループが止まらないようにするため。
 fn spawn_loader(on_loaded: impl Fn() + Send + 'static) -> (Sender<PathBuf>, Receiver<Loaded>) {
     let (request_tx, request_rx) = mpsc::channel::<PathBuf>();
     let (result_tx, result_rx) = mpsc::channel();
@@ -287,10 +322,12 @@ fn spawn_loader(on_loaded: impl Fn() + Send + 'static) -> (Sender<PathBuf>, Rece
     (request_tx, result_rx)
 }
 
-/// ディレクトリの中身を読む。並び順は ディレクトリ → ファイル、その中で名前順（大文字小文字を区別しない）
+/// ディレクトリの中身を読む。
+///
+/// 並び順は ディレクトリ → ファイル、それぞれ隠しファイルは後ろ、その中で名前順（大文字小文字を区別しない）。
 fn read_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
     let mut entries: Vec<Entry> = std::fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .map(|entry| Entry {
             name: entry.file_name().to_string_lossy().into_owned(),
             // 種類は read_dir の結果から分かるので、ファイルごとに調べ直さない（/mnt/c では特に遅い）。
@@ -313,7 +350,7 @@ fn read_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// 名前と種類が同じ並びか（ハイライトの状態は比べない）
+/// 名前と種類が同じ並びか（ハイライトの状態は比べない）。
 fn same_listing(a: &[Entry], b: &[Entry]) -> bool {
     a.len() == b.len()
         && a.iter()
@@ -321,11 +358,12 @@ fn same_listing(a: &[Entry], b: &[Entry]) -> bool {
             .all(|(x, y)| x.name == y.name && x.is_dir == y.is_dir)
 }
 
+/// シェルが glob として展開しそうな単語か。
 fn is_glob(word: &str) -> bool {
     word.contains(['*', '?', '['])
 }
 
-/// "src/" や "~/foo/" のような打ちかけのディレクトリ部分を、実在するディレクトリのパスにする
+/// `src/` や `~/foo/` のような打ちかけのディレクトリ部分を、実在するディレクトリのパスにする。
 fn resolve_dir(cwd: &Path, dir: &str) -> Option<PathBuf> {
     let path = match dir.strip_prefix("~/") {
         Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
@@ -334,9 +372,10 @@ fn resolve_dir(cwd: &Path, dir: &str) -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-/// コマンドラインから、表示中のディレクトリ dir を対象とする glob を取り出す。
-/// "*.log" は cwd、"src/*.rs" は cwd/src を対象とする。
-/// 引用符やバックスラッシュ付きのものはシェルが展開しないので除く
+/// コマンドラインから、表示中のディレクトリ `dir` を対象とする glob を取り出す。
+///
+/// `*.log` は `cwd`、`src/*.rs` は `cwd/src` を対象とする。
+/// 引用符やバックスラッシュ付きのものはシェルが展開しないので除く。
 fn parse_globs(line: &str, cwd: &Path, dir: &Path) -> Vec<GlobMatcher> {
     line.split_whitespace()
         .filter(|word| is_glob(word))
@@ -358,7 +397,9 @@ fn parse_globs(line: &str, cwd: &Path, dir: &Path) -> Vec<GlobMatcher> {
         .collect()
 }
 
-/// zsh と同じく、隠しファイルはパターンが . で始まるときだけマッチさせる
+/// ファイル名が glob にマッチするか。
+///
+/// zsh と同じく、隠しファイルはパターンが `.` で始まるときだけマッチさせる。
 fn glob_matches(glob: &GlobMatcher, name: &str) -> bool {
     if name.starts_with('.') && !glob.glob().glob().starts_with('.') {
         return false;

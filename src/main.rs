@@ -26,15 +26,19 @@ use panel::FilePanel;
 use selection::SharedSelection;
 use shell::{SCROLLBACK_LINES, read_input, resize, spawn_output_thread};
 
-/// 別スレッドからメインループに届く知らせ
+/// 別スレッドからメインループに届く知らせ。
 enum AppEvent {
-    /// シェルが何か出力した、またはスクロールした（画面を描き直す合図）
+    /// シェルが何か出力した、またはスクロールした（描き直しが必要）。
     Output,
+    /// シェルが終了した。
     Exited,
+    /// F12 が押された。
     TogglePanel,
-    /// パネルの読み込み係がディレクトリを読み終えた
+    /// パネルの読み込み係がディレクトリを読み終えた。
     PanelLoaded,
-    /// 選んだ文字をクリップボードに入れてほしい（画面への書き込みはメインループだけが行うため）
+    /// 選んだ文字をクリップボードに入れてほしい。
+    ///
+    /// 画面への書き込みはメインループだけが行うので、入力係から頼む。
     Copy(String),
 }
 
@@ -59,13 +63,14 @@ fn main() -> Result<()> {
     result
 }
 
-/// 外側のターミナルに制御文字列をそのまま送る
+/// 外側のターミナルに制御文字列をそのまま送る。
 fn write_raw(bytes: &[u8]) -> io::Result<()> {
     let mut stdout = io::stdout();
     stdout.write_all(bytes)?;
     stdout.flush()
 }
 
+/// シェルを起動し、終了するまで画面を描き続ける。
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let size = terminal.size()?;
     let mut visibility = PanelVisibility::new(size.width);
@@ -160,6 +165,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
+/// シェル側とパネルを描く。
 fn draw(
     terminal: &mut DefaultTerminal,
     parser: &Mutex<vt100::Parser>,
@@ -207,18 +213,21 @@ fn draw(
     Ok(())
 }
 
-/// wait_for_event の結果
+/// [`wait_for_event`] の結果。
 enum Wake {
-    /// シェルが終了した
+    /// シェルが終了した。
     Exited,
-    /// 何か知らせが届いた（描き直しが必要）
+    /// 描き直しが必要な知らせが届いた。
     Changed,
-    /// 描き直しの必要な知らせは届かなかった（パネルの読み込み完了だけ、または何も届かなかった）
+    /// 描き直しが必要な知らせは届かなかった。
+    ///
+    /// パネルの読み込み完了だけが届いたときも含む（描き直すかは `panel.update` が決める）。
     Idle,
 }
 
 /// 次の知らせを待つ。
-/// 何も来なくても 50ms ごとに戻り、ウィンドウサイズの変化を拾えるようにしている
+///
+/// 何も来なくても 50ms ごとに戻り、ウィンドウサイズの変化を拾えるようにしている。
 fn wait_for_event(rx: &Receiver<AppEvent>, visibility: &mut PanelVisibility) -> Result<Wake> {
     let first = match rx.recv_timeout(Duration::from_millis(50)) {
         Ok(event) => event,

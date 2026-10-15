@@ -1,4 +1,6 @@
-//! シェル側: PTY の出力を仮想端末（vt100）に流し込み、その画面から入力中の内容を読む
+//! シェル側。
+//!
+//! PTY の出力を仮想端末（vt100）に流し込み、その画面から入力中の内容を読む。
 
 use std::io::Read;
 use std::sync::mpsc::Sender;
@@ -10,9 +12,10 @@ use portable_pty::{MasterPty, PtySize};
 
 use crate::AppEvent;
 
-/// 左ペインの履歴として覚えておく行数
+/// 左ペインの履歴として覚えておく行数。
 pub const SCROLLBACK_LINES: usize = 10_000;
 
+/// PTY と仮想端末の大きさを変える。
 pub fn resize(master: &dyn MasterPty, parser: &Mutex<vt100::Parser>, size: PtySize) -> Result<()> {
     // PTYの大きさを変えると、シェルに画面サイズが変わったと通知される
     master.resize(size)?;
@@ -24,7 +27,9 @@ pub fn resize(master: &dyn MasterPty, parser: &Mutex<vt100::Parser>, size: PtySi
     Ok(())
 }
 
-/// シェルの出力 → 仮想端末。届くたびにメインループへ描き直しを頼む
+/// 出力係のスレッドを立てる。
+///
+/// シェルの出力を仮想端末に流し込み、届くたびにメインループへ描き直しを頼む。
 pub fn spawn_output_thread(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
@@ -47,10 +52,12 @@ pub fn spawn_output_thread(
     });
 }
 
-/// 画面から入力中の内容を読む。返すのは (カーソル行全体, カーソル直前の打ちかけの単語)。
+/// 画面から入力中の内容を読む。
+///
+/// 返すのは `(カーソル行全体, カーソル直前の打ちかけの単語)`。
 /// 行全体にはプロンプトも混ざるが、glob を探すだけなら問題ない。
 /// 単語はカーソルから左の空白までなので、プロンプトは混ざらない。
-/// vim などが別画面を使っている間は、シェルの入力ではないので空にする
+/// vim などが別画面を使っている間は、シェルの入力ではないので空にする。
 pub fn read_input(parser: &vt100::Parser) -> (String, String) {
     let screen = parser.screen();
     if screen.alternate_screen() {
