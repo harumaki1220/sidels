@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +14,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 mod input;
 mod layout;
+mod mouse;
 mod panel;
 mod shell;
 
@@ -37,16 +38,27 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // 外側のターミナルに、貼り付けた文字を印で囲んで送ってもらう。
     execute!(io::stdout(), EnableBracketedPaste)?;
+    // マウス操作も送ってもらう（ホイールでのスクロールなど）
+    write_raw(mouse::ENABLE)?;
     let ratatui_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = write_raw(mouse::DISABLE);
         ratatui_hook(info);
     }));
     // run の中で ? によるエラーが起きても、必ず restore まで来る
     let result = run(&mut terminal);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = write_raw(mouse::DISABLE);
     ratatui::restore();
     result
+}
+
+/// 外側のターミナルに制御文字列をそのまま送る
+fn write_raw(bytes: &[u8]) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.write_all(bytes)?;
+    stdout.flush()
 }
 
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {

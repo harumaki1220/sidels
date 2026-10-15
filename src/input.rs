@@ -1,4 +1,4 @@
-//! 入力係: キーボード → シェル。sidels のキー（パネルの出し入れ・スクロール）と貼り付けの印を処理する
+//! 入力係: キーボード・マウス → シェル。sidels のキー（パネルの出し入れ・スクロール）、マウス操作、貼り付けの印を処理する
 
 use std::io::{self, Read, Write};
 use std::sync::mpsc::Sender;
@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::AppEvent;
+use crate::mouse::{self, MouseEvent};
 
 /// sidels が横取りするキー。端末からはこのバイト列で届く
 #[derive(Clone, Copy)]
@@ -14,6 +15,8 @@ enum SpecialKey {
     TogglePanel,
     /// 左ペインの履歴をスクロールする
     Scroll(ScrollStep),
+    /// マウス操作（sidels が外側のターミナルに頼んで送ってもらっている）
+    Mouse(MouseEvent),
 }
 
 #[derive(Clone, Copy)]
@@ -50,17 +53,23 @@ pub fn spawn_input_thread(
     thread::spawn(move || {
         let mut stdin = io::stdin();
         let mut buf = [0u8; 1024];
+        // 前回の読み込みの最後で途中まで届いていたマウス操作。次に届いた分とつなげて読む
+        let mut carry: Vec<u8> = Vec::new();
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    let mut data = std::mem::take(&mut carry);
+                    data.extend_from_slice(&buf[..n]);
+                    let complete = mouse::incomplete_tail_start(&data);
+                    carry = data.split_off(complete);
                     // vim などが別画面を使っている間は、スクロールのキーもアプリに渡す
                     let (can_scroll, app_wants_paste) = {
                         let parser = parser.lock().unwrap();
                         let screen = parser.screen();
                         (!screen.alternate_screen(), screen.bracketed_paste())
                     };
-                    let (input, keys) = take_special_keys(&buf[..n], can_scroll);
+                    let (input, keys) = take_special_keys(&data, can_scroll);
                     // 貼り付けの印は、中のアプリ（zsh など）が頼んでいるときだけ渡す。
                     // 頼んでいないアプリに渡すと、印がそのまま文字として入ってしまう
                     let input = if app_wants_paste {
@@ -74,6 +83,12 @@ pub fn spawn_input_thread(
                             SpecialKey::Scroll(step) => {
                                 scroll(&parser, step);
                                 AppEvent::Output
+                            }
+                            SpecialKey::Mouse(event) => {
+                                match handle_mouse(&event, &parser, &mut writer) {
+                                    Some(event) => event,
+                                    None => continue,
+                                }
                             }
                         };
                         if tx.send(event).is_err() {
@@ -106,6 +121,12 @@ fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey
     let mut keys = Vec::new();
     let mut i = 0;
     'outer: while i < input.len() {
+        // マウス操作はシェルに文字として届くと困るので、必ず抜き取る
+        if let Some((event, len)) = mouse::parse_sgr(&input[i..]) {
+            keys.push(SpecialKey::Mouse(event));
+            i += len;
+            continue;
+        }
         for &(seq, key) in SPECIAL_KEYS {
             let is_scroll = matches!(key, SpecialKey::Scroll(_));
             if input[i..].starts_with(seq) && (can_scroll || !is_scroll) {
@@ -118,6 +139,65 @@ fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey
         i += 1;
     }
     (rest, keys)
+}
+
+/// マウス操作を振り分ける。描き直しが必要なら知らせを返す
+/// - シェル側の外（パネルの上）: 今は何もしない
+/// - 中のアプリがマウスを頼んでいる（vim や htop など）: アプリが頼んだ形式で渡す。
+///   シェル側は画面の左上にあるので、座標はそのままでよい
+/// - ホイール: 別画面（less など）なら ↑↓ キーとして渡し、普段は履歴をスクロールする
+fn handle_mouse(
+    event: &MouseEvent,
+    parser: &Mutex<vt100::Parser>,
+    writer: &mut Box<dyn Write + Send>,
+) -> Option<AppEvent> {
+    let (rows, cols, mode, encoding, alternate, app_cursor) = {
+        let parser = parser.lock().unwrap();
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        (
+            rows,
+            cols,
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+            screen.alternate_screen(),
+            screen.application_cursor(),
+        )
+    };
+    if event.col > cols || event.row > rows {
+        return None;
+    }
+
+    if mode != vt100::MouseProtocolMode::None {
+        if let Some(bytes) = mouse::encode_for_app(event, mode, encoding) {
+            let _ = writer.write_all(&bytes).and_then(|()| writer.flush());
+        }
+        return None;
+    }
+
+    if !event.is_wheel() {
+        return None;
+    }
+    let up = event.is_wheel_up();
+    if alternate {
+        let key: &[u8] = match (up, app_cursor) {
+            (true, true) => b"\x1bOA",
+            (true, false) => b"\x1b[A",
+            (false, true) => b"\x1bOB",
+            (false, false) => b"\x1b[B",
+        };
+        let _ = writer
+            .write_all(&key.repeat(SCROLL_LINES))
+            .and_then(|()| writer.flush());
+        return None;
+    }
+    let step = if up {
+        ScrollStep::LinesUp
+    } else {
+        ScrollStep::LinesDown
+    };
+    scroll(parser, step);
+    Some(AppEvent::Output)
 }
 
 /// input から needle をすべて取り除く
