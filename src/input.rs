@@ -7,6 +7,7 @@ use std::thread;
 
 use crate::AppEvent;
 use crate::mouse::{self, MouseEvent};
+use crate::selection::{Selection, SharedSelection};
 
 /// sidels が横取りするキー。端末からはこのバイト列で届く
 #[derive(Clone, Copy)]
@@ -48,6 +49,7 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 pub fn spawn_input_thread(
     mut writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
+    selection: SharedSelection,
     tx: Sender<AppEvent>,
 ) {
     thread::spawn(move || {
@@ -81,11 +83,13 @@ pub fn spawn_input_thread(
                         let event = match key {
                             SpecialKey::TogglePanel => AppEvent::TogglePanel,
                             SpecialKey::Scroll(step) => {
+                                // 見えている範囲が動くので、選択は外す
+                                clear_selection(&selection);
                                 scroll(&parser, step);
                                 AppEvent::Output
                             }
                             SpecialKey::Mouse(event) => {
-                                match handle_mouse(&event, &parser, &mut writer) {
+                                match handle_mouse(&event, &parser, &selection, &mut writer) {
                                     Some(event) => event,
                                     None => continue,
                                 }
@@ -97,6 +101,10 @@ pub fn spawn_input_thread(
                     }
                     if input.is_empty() {
                         continue;
+                    }
+                    // 何か打ったら選択を外す
+                    if clear_selection(&selection) {
+                        let _ = tx.send(AppEvent::Output);
                     }
                     // 普通のターミナルと同じく、何か打ったら最新の画面に戻る
                     let mut parser_guard = parser.lock().unwrap();
@@ -149,6 +157,7 @@ fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey
 fn handle_mouse(
     event: &MouseEvent,
     parser: &Mutex<vt100::Parser>,
+    selection: &Mutex<Option<Selection>>,
     writer: &mut Box<dyn Write + Send>,
 ) -> Option<AppEvent> {
     let (rows, cols, mode, encoding, alternate, app_cursor) = {
@@ -164,20 +173,29 @@ fn handle_mouse(
             screen.application_cursor(),
         )
     };
-    if event.col > cols || event.row > rows {
-        return None;
-    }
+    let in_shell = event.col <= cols && event.row <= rows;
 
     if mode != vt100::MouseProtocolMode::None {
-        if let Some(bytes) = mouse::encode_for_app(event, mode, encoding) {
+        if in_shell && let Some(bytes) = mouse::encode_for_app(event, mode, encoding) {
             let _ = writer.write_all(&bytes).and_then(|()| writer.flush());
         }
         return None;
     }
 
-    if !event.is_wheel() {
+    if event.is_left() {
+        // パネルの上までドラッグしても、選ぶのはシェル側の端まで
+        let pos = (
+            event.row.clamp(1, rows.max(1)) - 1,
+            event.col.clamp(1, cols.max(1)) - 1,
+        );
+        return handle_selection(event, in_shell, pos, parser, selection);
+    }
+
+    if !event.is_wheel() || !in_shell {
         return None;
     }
+    // 見えている範囲が動くので、選択は外す
+    clear_selection(selection);
     let up = event.is_wheel_up();
     if alternate {
         let key: &[u8] = match (up, app_cursor) {
@@ -198,6 +216,43 @@ fn handle_mouse(
     };
     scroll(parser, step);
     Some(AppEvent::Output)
+}
+
+/// 左ボタンでの選択。押すと始まり、ドラッグで広げ、離したら選んだ文字をコピーする。
+/// 何も選ばずに離した（クリックしただけ）なら選択を外す
+fn handle_selection(
+    event: &MouseEvent,
+    in_shell: bool,
+    pos: (u16, u16),
+    parser: &Mutex<vt100::Parser>,
+    selection: &Mutex<Option<Selection>>,
+) -> Option<AppEvent> {
+    let finished = {
+        let mut current = selection.lock().unwrap();
+        if event.pressed && !event.is_motion() {
+            // パネルの上で押したときは、選択を外すだけ
+            *current = in_shell.then(|| Selection::new(pos));
+            return Some(AppEvent::Output);
+        }
+        let selected = current.as_mut()?;
+        selected.extend(pos);
+        if event.pressed {
+            return Some(AppEvent::Output);
+        }
+        if selected.is_empty() {
+            *current = None;
+            return Some(AppEvent::Output);
+        }
+        *selected
+    };
+    // 選択のロックを外してから仮想端末をロックする（描画側と順番が逆になるとデッドロックする）
+    let text = finished.text(parser.lock().unwrap().screen());
+    Some(AppEvent::Copy(text))
+}
+
+/// 選択を外す。外したら true
+fn clear_selection(selection: &Mutex<Option<Selection>>) -> bool {
+    selection.lock().unwrap().take().is_some()
 }
 
 /// input から needle をすべて取り除く

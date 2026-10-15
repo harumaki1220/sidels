@@ -29,8 +29,14 @@ impl MouseEvent {
         self.is_wheel() && self.code & 1 == 0
     }
 
-    fn is_motion(&self) -> bool {
+    /// ボタンを押したまま動かした（ドラッグ中）
+    pub fn is_motion(&self) -> bool {
         self.code & 32 != 0
+    }
+
+    /// 左ボタンの操作（押す・ドラッグ・離す）
+    pub fn is_left(&self) -> bool {
+        !self.is_wheel() && self.code & 3 == 0
     }
 }
 
