@@ -54,7 +54,7 @@ struct Entry {
 }
 
 impl FilePanel {
-    /// on_loaded は読み込み係が結果を届けるたびに呼ばれる（描き直しの合図に使う）
+    /// on_loaded は読み込み係が結果を届けるたびに呼ばれる（メインループを起こして update を呼んでもらう合図に使う）
     pub fn new(
         shell_pid: Option<u32>,
         start_dir: PathBuf,
@@ -81,7 +81,12 @@ impl FilePanel {
 
     /// シェルの現在地と入力中のコマンドラインから、表示するディレクトリ・絞り込み・ハイライトを決める。
     /// line はカーソル行全体、word はカーソル直前の打ちかけの単語
-    pub fn update(&mut self, line: &str, word: &str) {
+    /// 表示が変わったら true を返す（変わっていなければ描き直さなくてよい）
+    pub fn update(&mut self, line: &str, word: &str) -> bool {
+        let title_before = self.title();
+        let filter_before = self.filter.clone();
+        let mut listing_changed = false;
+
         if let Some(cwd) = self.shell_cwd() {
             self.cwd = cwd;
         }
@@ -91,7 +96,9 @@ impl FilePanel {
         // 読み終わった結果を受け取る
         let mut reloaded = false;
         while let Ok(loaded) = self.load_rx.try_recv() {
-            reloaded |= self.apply(loaded);
+            let (accepted, changed) = self.apply(loaded);
+            reloaded |= accepted;
+            listing_changed |= changed;
         }
 
         // 別の場所に切り替えるときと、同じ場所でも一定時間たったときは、読み込みを頼む
@@ -101,7 +108,9 @@ impl FilePanel {
             self.pending = Some(self.wanted.clone());
             let _ = self.load_tx.send(self.wanted.clone());
             if switching && let Ok(loaded) = self.load_rx.recv_timeout(SWITCH_WAIT) {
-                reloaded |= self.apply(loaded);
+                let (accepted, changed) = self.apply(loaded);
+                reloaded |= accepted;
+                listing_changed |= changed;
             }
         }
 
@@ -118,6 +127,11 @@ impl FilePanel {
             self.globs = parse_globs(line, &self.cwd, &self.dir);
             self.mark_matches();
         }
+
+        listing_changed
+            || line_changed
+            || self.filter != filter_before
+            || self.title() != title_before
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -171,28 +185,27 @@ impl FilePanel {
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
-    /// 読み込み係からの結果を反映する。今表示したい場所の結果だったら true
-    fn apply(&mut self, (dir, result): Loaded) -> bool {
+    /// 読み込み係からの結果を反映する。返すのは (今表示したい場所の結果だったか, 一覧の中身が変わったか)。
+    /// 1 秒ごとの読み直しで中身が同じなら描き直さなくてよいので、変わったかどうかを分けて返す
+    fn apply(&mut self, (dir, result): Loaded) -> (bool, bool) {
         if self.pending.as_ref() == Some(&dir) {
             self.pending = None;
         }
         // 入力が進んで、もう表示したくない場所の結果は捨てる
         if dir != self.wanted {
-            return false;
+            return (false, false);
         }
+        let (entries, error) = match result {
+            Ok(entries) => (entries, None),
+            Err(err) => (Vec::new(), Some(format!("読み込めません: {err}"))),
+        };
+        let changed =
+            dir != self.dir || error != self.error || !same_listing(&entries, &self.entries);
         self.dir = dir;
         self.last_refresh = Instant::now();
-        match result {
-            Ok(entries) => {
-                self.entries = entries;
-                self.error = None;
-            }
-            Err(err) => {
-                self.entries.clear();
-                self.error = Some(format!("読み込めません: {err}"));
-            }
-        }
-        true
+        self.entries = entries;
+        self.error = error;
+        (true, changed)
     }
 
     fn mark_matches(&mut self) {
@@ -298,6 +311,14 @@ fn read_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
+}
+
+/// 名前と種類が同じ並びか（ハイライトの状態は比べない）
+fn same_listing(a: &[Entry], b: &[Entry]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.name == y.name && x.is_dir == y.is_dir)
 }
 
 fn is_glob(word: &str) -> bool {
