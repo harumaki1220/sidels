@@ -264,6 +264,13 @@ fn handle_selection(
     };
     // 選択のロックを外してから仮想端末をロックする（描画側と順番が逆になるとデッドロックする）
     let text = finished.text(parser.lock().unwrap().screen());
+    // 何も書かれていない場所を選んだだけなら、コピーせずに選択を外す。
+    // 空の文字をコピーすると、クリップボードに入っていた中身が消えてしまう
+    // （ウィンドウを選ぶつもりのクリックで、マウスが少し動いただけでも起きる）
+    if text.trim().is_empty() {
+        clear_selection(selection);
+        return Some(AppEvent::Output);
+    }
     Some(AppEvent::Copy(text))
 }
 
