@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use tui_term::widget::{Cursor, PseudoTerminal};
 
+mod git;
 mod input;
 mod layout;
 mod mouse;

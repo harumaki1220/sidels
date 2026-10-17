@@ -1,9 +1,11 @@
 //! 右側のファイル一覧パネル。
 //!
 //! シェルの現在地の中身を表示し、入力中のコマンドラインに合わせて
-//! 移動先のプレビュー・絞り込み・glob ハイライトを行う。
+//! 移動先のプレビュー・絞り込み・glob ハイライトを行う。Git の管理下なら、変更のあるファイルに印を付ける。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,8 +14,10 @@ use globset::{GlobBuilder, GlobMatcher};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
+
+use crate::git::{self, GitKind, GitMark};
 
 /// 同じディレクトリを読み直す間隔。
 ///
@@ -30,6 +34,11 @@ const SWITCH_WAIT: Duration = Duration::from_millis(20);
 ///
 /// どのディレクトリを読んだかと、中身またはエラーメッセージ。
 type Loaded = (PathBuf, Result<Vec<Entry>, String>);
+
+/// Git 係から届く結果。
+///
+/// どのディレクトリを調べたかと、ファイル名ごとの印（Git の管理下でなければ `None`）。
+type GitLoaded = (PathBuf, Option<HashMap<String, GitMark>>);
 
 /// 右側のファイル一覧パネル。
 pub struct FilePanel {
@@ -53,6 +62,16 @@ pub struct FilePanel {
     load_rx: Receiver<Loaded>,
     /// 最後に依頼して、まだ結果が届いていないディレクトリ。
     pending: Option<PathBuf>,
+    /// Git 係への依頼。
+    git_tx: Sender<PathBuf>,
+    /// Git 係からの結果。
+    git_rx: Receiver<GitLoaded>,
+    /// Git 係に依頼して、まだ結果が届いていない。
+    ///
+    /// 大きなリポジトリでは `git status` が遅いので、終わる前に次を頼まない。
+    git_pending: bool,
+    /// `dir` の中のファイル名ごとの Git の印。Git の管理下でなければ `None`。
+    git: Option<HashMap<String, GitMark>>,
     /// 最後に受け取ったコマンドライン。変わったときだけ glob を作り直す。
     command_line: String,
     /// コマンドライン中の glob のうち、`dir` を対象とするもの。
@@ -72,16 +91,23 @@ struct Entry {
 }
 
 impl FilePanel {
-    /// パネルを作り、読み込み係のスレッドを立てる。
+    /// パネルを作り、読み込み係と Git 係のスレッドを立てる。
     ///
-    /// `on_loaded` は読み込み係が結果を届けるたびに呼ばれる。
+    /// `on_loaded` はどちらかが結果を届けるたびに呼ばれる。
     /// メインループを起こして [`FilePanel::update`] を呼んでもらう合図に使う。
     pub fn new(
         shell_pid: Option<u32>,
         start_dir: PathBuf,
-        on_loaded: impl Fn() + Send + 'static,
+        on_loaded: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        let (load_tx, load_rx) = spawn_loader(on_loaded);
+        let on_loaded: Arc<dyn Fn() + Send + Sync> = Arc::new(on_loaded);
+        let (load_tx, load_rx) = spawn_worker(
+            |dir| read_entries(dir).map_err(|err| err.to_string()),
+            Arc::clone(&on_loaded),
+        );
+        // git status は遅いことがあるので、一覧の読み込みとは別のスレッドで調べる。
+        // 同じスレッドだと、git status が終わるまで別のディレクトリへの切り替えが待たされる
+        let (git_tx, git_rx) = spawn_worker(git::status, on_loaded);
         Self {
             shell_pid,
             cwd: start_dir.clone(),
@@ -94,6 +120,10 @@ impl FilePanel {
             load_tx,
             load_rx,
             pending: None,
+            git_tx,
+            git_rx,
+            git_pending: false,
+            git: None,
             command_line: String::new(),
             globs: Vec::new(),
             filter: String::new(),
@@ -135,6 +165,19 @@ impl FilePanel {
             }
         }
 
+        while let Ok((dir, marks)) = self.git_rx.try_recv() {
+            self.git_pending = false;
+            if dir == self.dir && marks != self.git {
+                self.git = marks;
+                listing_changed = true;
+            }
+        }
+        // 一覧を読み直したら、Git の状態も調べ直す（一覧を先に出し、印はあとから付ける）
+        if reloaded && !self.git_pending {
+            self.git_pending = true;
+            let _ = self.git_tx.send(self.dir.clone());
+        }
+
         // 絞り込みは wanted に対するものなので、まだ前の場所を表示している間はかけない
         self.filter = if self.wanted == self.dir {
             filter
@@ -166,7 +209,10 @@ impl FilePanel {
                 message.clone(),
                 Style::default().fg(Color::Red),
             ))],
-            None => self.visible_entries().map(Entry::to_list_item).collect(),
+            None => self
+                .visible_entries()
+                .map(|entry| entry.to_list_item(self.git.as_ref()))
+                .collect(),
         };
 
         frame.render_widget(List::new(items).block(block), area);
@@ -231,6 +277,10 @@ impl FilePanel {
         };
         let changed =
             dir != self.dir || error != self.error || !same_listing(&entries, &self.entries);
+        if dir != self.dir {
+            // 前の場所の印が、新しい場所の同じ名前のファイルに付かないように消しておく
+            self.git = None;
+        }
         self.dir = dir;
         self.last_refresh = Instant::now();
         self.entries = entries;
@@ -275,7 +325,10 @@ impl Entry {
         self.name.starts_with('.')
     }
 
-    fn to_list_item(&self) -> ListItem<'_> {
+    /// パネルの 1 行にする。
+    ///
+    /// `git` は表示中のディレクトリの Git の印（Git の管理下でなければ `None`）。
+    fn to_list_item(&self, git: Option<&HashMap<String, GitMark>>) -> ListItem<'_> {
         let (text, style) = if self.is_dir {
             (
                 format!("{}/", self.name),
@@ -296,27 +349,53 @@ impl Entry {
         } else {
             style
         };
-        ListItem::new(Line::styled(text, style))
+        let name = Span::styled(text, style);
+        let Some(marks) = git else {
+            return ListItem::new(Line::from(name));
+        };
+        // Git の管理下では、名前の位置を揃えるため、印がなくても 2 列空ける
+        let mark = match marks.get(&self.name) {
+            Some(mark) => Span::styled(
+                format!("{} ", mark.letter),
+                Style::default().fg(mark_color(mark.kind)),
+            ),
+            None => Span::raw("  "),
+        };
+        ListItem::new(Line::from(vec![mark, name]))
     }
 }
 
-/// 読み込み係のスレッドを立てる。
+/// Git の印の色。`git status` の色分けに合わせ、`git add` 済みは緑、まだの変更は黄色にする。
+fn mark_color(kind: GitKind) -> Color {
+    match kind {
+        GitKind::Staged => Color::Green,
+        GitKind::Untracked => Color::Red,
+        GitKind::Modified => Color::Yellow,
+        GitKind::Conflict => Color::Magenta,
+    }
+}
+
+/// 依頼されたディレクトリを裏で調べる係のスレッドを立てる。
 ///
-/// /mnt/c のような遅い場所を読んでも、メインループが止まらないようにするため。
-fn spawn_loader(on_loaded: impl Fn() + Send + 'static) -> (Sender<PathBuf>, Receiver<Loaded>) {
+/// /mnt/c のような遅い場所を調べても、メインループが止まらないようにするため。
+/// 調べ終わるたびに `notify` を呼ぶ。
+fn spawn_worker<R: Send + 'static>(
+    work: fn(&Path) -> R,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) -> (Sender<PathBuf>, Receiver<(PathBuf, R)>) {
     let (request_tx, request_rx) = mpsc::channel::<PathBuf>();
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
         while let Ok(mut dir) = request_rx.recv() {
-            // 読んでいる間に依頼が溜まっていたら、最新のものだけ読む
+            // 調べている間に依頼が溜まっていたら、最新のものだけ調べる
             while let Ok(newer) = request_rx.try_recv() {
                 dir = newer;
             }
-            let result = read_entries(&dir).map_err(|err| err.to_string());
+            let result = work(&dir);
             if result_tx.send((dir, result)).is_err() {
                 return;
             }
-            on_loaded();
+            notify();
         }
     });
     (request_tx, result_rx)
