@@ -26,7 +26,7 @@ cd のたびに ls を打つ手間をなくすのが目的。Rust 製。
 
 - 入力の取得を画面読み取りからシェル連携に変える（zsh-autosuggestions の灰色の候補や折り返しに対応するため）
 - ファイルの種類ごとのアイコン（Nerd Font）。持っていない人には文字化けするので、`--icons` などで使いたい人だけオンにする
-- 人に使ってもらう準備の残り: README にスクリーンショットを足す、CI（GitHub Actions で build と clippy）
+- README にスクリーンショットを足す
 - パネルにフォーカスを移してファイルを選び、コマンドラインにパスを挿入する（やりすぎるとファイルマネージャーになってしまうので控えめに）
 
 ## 構成
@@ -69,6 +69,7 @@ anyhow / crossterm 0.29 / globset 0.4 / portable-pty 0.9 / ratatui 0.30 / tui-te
 ## 開発の進め方
 
 - 動作確認は手動（`cargo run` して実際に触る）。変更後は最低限 `cargo build` と `cargo clippy` が通ること
+- push すると CI（`.github/workflows/ci.yml`）が `cargo fmt --check`、`cargo clippy -- -D warnings`（警告もエラー扱い）、build、test と、Rust 1.88 でのビルドを確かめる。コミット前に `cargo fmt` をかけておく
 - コミットメッセージは英語の Conventional Commits（`feat:` `fix:` `refactor:` など、続きは小文字始まり）
 - 変更するときは、何をなぜ変えたかを短く説明すること
 - コメントは「なぜ」を書く。名前を読めば分かることは書かない
