@@ -2,6 +2,7 @@
 name = "sidels"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A small tool that keeps the current directory listing visible beside your shell"
 license = "MIT"
 repository = "https://github.com/harumaki1220/sidels"

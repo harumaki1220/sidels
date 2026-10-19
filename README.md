@@ -11,8 +11,10 @@ Git の管理下では、変更のあるファイルに `M` や `?` の印が付
 
 ## インストール
 
+Rust 1.88 以上と、C のリンカーが必要です（Ubuntu なら `sudo apt install build-essential`）。
+
 ```sh
-cargo install --git https://github.com/harumaki1220/sidels
+cargo install --locked --git https://github.com/harumaki1220/sidels
 ```
 
 `sidels` で起動し、`exit` でシェルを終えると一緒に終了します。
