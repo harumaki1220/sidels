@@ -209,10 +209,25 @@ impl FilePanel {
                 message.clone(),
                 Style::default().fg(Color::Red),
             ))],
-            None => self
-                .visible_entries()
-                .map(|entry| entry.to_list_item(self.git.as_ref()))
-                .collect(),
+            None => {
+                let rows = usize::from(block.inner(area).height);
+                let entries: Vec<&Entry> = self.visible_entries().collect();
+                if entries.len() <= rows {
+                    entries
+                        .iter()
+                        .map(|entry| entry.to_list_item(self.git.as_ref()))
+                        .collect()
+                } else {
+                    // 入りきらないときは最後の 1 行を使って、隠れている件数を知らせる
+                    let shown = rows.saturating_sub(1);
+                    let mut items: Vec<ListItem> = entries[..shown]
+                        .iter()
+                        .map(|entry| entry.to_list_item(self.git.as_ref()))
+                        .collect();
+                    items.push(overflow_item(&entries[shown..]));
+                    items
+                }
+            }
         };
 
         frame.render_widget(List::new(items).block(block), area);
@@ -363,6 +378,23 @@ impl Entry {
         };
         ListItem::new(Line::from(vec![mark, name]))
     }
+}
+
+/// パネルに入りきらなかった分を知らせる 1 行（「… 他 N 件」）。
+///
+/// 隠れた中に glob にマッチするものがあれば、その件数も目立たせて出す。
+/// `rm *.log` で消えるファイルが見えないところにある、というのを見逃さないため。
+fn overflow_item(hidden: &[&Entry]) -> ListItem<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut spans = vec![Span::styled(format!("… 他 {} 件", hidden.len()), dim)];
+    let matched = hidden.iter().filter(|entry| entry.highlighted).count();
+    if matched > 0 {
+        spans.push(Span::styled(
+            format!("（{matched} 件該当）"),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 /// Git の印の色。`git status` の色分けに合わせ、`git add` 済みは緑、まだの変更は黄色にする。
