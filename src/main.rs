@@ -1,13 +1,13 @@
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::cursor::Hide;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
-use portable_pty::{CommandBuilder, native_pty_system};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -26,6 +26,12 @@ use layout::{PanelVisibility, pty_size_for, split};
 use panel::FilePanel;
 use selection::SharedSelection;
 use shell::{SCROLLBACK_LINES, read_input, resize, spawn_output_thread};
+
+/// ウィンドウの大きさが変わってから、シェル側の大きさを合わせるまで待つ時間。
+///
+/// ドラッグ中に 1 列変わるたびに PTY を変えると、そのたびにシェルがプロンプトを描き直してちらつく。
+/// 大きさが変わらないままこの時間がたったら（ドラッグが止まったら）、まとめて 1 回だけ変える。
+const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 
 /// 別スレッドからメインループに届く知らせ。
 enum AppEvent {
@@ -127,23 +133,41 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     // 毎回描くとカーソルの点滅がリセットされ続けてチラつく
     let mut needs_draw = true;
     let mut last_layout = None;
+    // 合わせたいシェル側の大きさと、その大きさになった時刻（RESIZE_SETTLE だけ待ってから合わせる）
+    let mut pending_resize: Option<(PtySize, Instant)> = None;
     loop {
         // ウィンドウの大きさが変わっていたら、PTYと仮想端末も合わせる
         let size = terminal.size()?;
         visibility.set_width(size.width);
         let panel_visible = visibility.is_visible();
         let layout = (size.width, size.height, panel_visible);
+        // F12 での出し入れは、待たずにすぐ合わせる（キーを押したのに反応が遅れると、もたついて感じる）
+        let toggled = last_layout.map(|(_, _, visible)| visible) != Some(panel_visible);
         if last_layout != Some(layout) {
             last_layout = Some(layout);
             needs_draw = true;
         }
         let (left, _) = split(Rect::new(0, 0, size.width, size.height), panel_visible);
         let new_size = pty_size_for(left);
-        if (new_size.rows, new_size.cols) != (pty_size.rows, pty_size.cols) {
-            resize(master.as_ref(), &parser, new_size)?;
-            pty_size = new_size;
-            // 画面の大きさが変わると選択範囲の位置がずれるので外す
-            *selection.lock().unwrap() = None;
+        let same = |a: PtySize, b: PtySize| (a.rows, a.cols) == (b.rows, b.cols);
+        if same(new_size, pty_size) {
+            pending_resize = None;
+        } else {
+            let settled = match pending_resize {
+                Some((size, since)) if same(size, new_size) => since.elapsed() >= RESIZE_SETTLE,
+                _ => {
+                    pending_resize = Some((new_size, Instant::now()));
+                    false
+                }
+            };
+            if settled || toggled {
+                resize(master.as_ref(), &parser, new_size)?;
+                pty_size = new_size;
+                pending_resize = None;
+                needs_draw = true;
+                // 画面の大きさが変わると選択範囲の位置がずれるので外す
+                *selection.lock().unwrap() = None;
+            }
         }
 
         // 隠している間はディレクトリを読みに行かない。
