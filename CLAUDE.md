@@ -59,7 +59,7 @@ cd のたびに ls を打つ手間をなくすのが目的。Rust 製。
 
 ## 依存
 
-anyhow / crossterm 0.29 / globset 0.4 / portable-pty 0.9 / ratatui 0.30 / tui-term 0.3.4 / vt100 0.16
+anyhow / crossterm 0.29 / globset 0.4 / portable-pty 0.9 / ratatui 0.30 / tui-term 0.3.4 / unicode-width 0.2 / vt100 0.16
 （ratatui・tui-term・vt100・crossterm はバージョンの組み合わせが合っている必要がある）
 
 ## 未対応・既知の制限

@@ -16,6 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::git::{self, GitKind, GitMark};
 
@@ -210,20 +211,19 @@ impl FilePanel {
                 Style::default().fg(Color::Red),
             ))],
             None => {
-                let rows = usize::from(block.inner(area).height);
+                let inner = block.inner(area);
+                let rows = usize::from(inner.height);
+                // Git の印の 2 列を除いた、名前に使える幅
+                let mark_width = if self.git.is_some() { 2 } else { 0 };
+                let name_width = usize::from(inner.width).saturating_sub(mark_width);
+                let item = |entry: &&Entry| entry.to_list_item(self.git.as_ref(), name_width);
                 let entries: Vec<&Entry> = self.visible_entries().collect();
                 if entries.len() <= rows {
-                    entries
-                        .iter()
-                        .map(|entry| entry.to_list_item(self.git.as_ref()))
-                        .collect()
+                    entries.iter().map(item).collect()
                 } else {
                     // 入りきらないときは最後の 1 行を使って、隠れている件数を知らせる
                     let shown = rows.saturating_sub(1);
-                    let mut items: Vec<ListItem> = entries[..shown]
-                        .iter()
-                        .map(|entry| entry.to_list_item(self.git.as_ref()))
-                        .collect();
+                    let mut items: Vec<ListItem> = entries[..shown].iter().map(item).collect();
                     items.push(overflow_item(&entries[shown..]));
                     items
                 }
@@ -343,16 +343,19 @@ impl Entry {
     /// パネルの 1 行にする。
     ///
     /// `git` は表示中のディレクトリの Git の印（Git の管理下でなければ `None`）。
-    fn to_list_item(&self, git: Option<&HashMap<String, GitMark>>) -> ListItem<'_> {
-        let (text, style) = if self.is_dir {
-            (
-                format!("{}/", self.name),
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            )
+    /// 名前は `name_width` 列に収まるよう、長ければ真ん中を省略する。
+    fn to_list_item(
+        &self,
+        git: Option<&HashMap<String, GitMark>>,
+        name_width: usize,
+    ) -> ListItem<'static> {
+        let text = fit_name(&self.name, self.is_dir, name_width);
+        let style = if self.is_dir {
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         } else {
-            (self.name.clone(), Style::default())
+            Style::default()
         };
         let style = if self.is_hidden() {
             style.add_modifier(Modifier::DIM)
@@ -378,6 +381,57 @@ impl Entry {
         };
         ListItem::new(Line::from(vec![mark, name]))
     }
+}
+
+/// 名前を `max` 列に収める（ディレクトリには最後に `/` を付ける）。
+///
+/// 収まらないときは真ん中を「…」で省略し、先頭と拡張子を残す（`very-long-n…report.md`）。
+/// 末尾を切るだけだと、何の種類のファイルか分からなくなるため。
+/// 拡張子が短ければ、名前の後ろの方も少し（使える幅の 1/3 くらいまで）残す。拡張子が長くても、末尾は半分まで。
+fn fit_name(name: &str, is_dir: bool, max: usize) -> String {
+    let suffix = if is_dir { "/" } else { "" };
+    if name.width() + suffix.len() <= max {
+        return format!("{name}{suffix}");
+    }
+    // 「…」と最後の `/` を除いた、名前に使える幅
+    let room = max.saturating_sub(1 + suffix.len());
+    if room == 0 {
+        return "…".chars().take(max).collect();
+    }
+    // 拡張子は最後の `.` から後ろ。先頭の `.` は隠しファイルの印なので拡張子ではない
+    let ext_start = name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len());
+    let tail_room = name[ext_start..]
+        .width()
+        .max(room / 3)
+        // 拡張子がとても長くても、先頭が見えるように末尾は半分まで
+        .min(room / 2);
+    let tail = take_end(name, tail_room);
+    let head = take_start(name, room - tail.width());
+    format!("{head}…{tail}{suffix}")
+}
+
+/// 先頭から、幅が `max` 列を超えない分だけ取る。
+fn take_start(s: &str, max: usize) -> &str {
+    let mut width = 0;
+    for (i, c) in s.char_indices() {
+        width += c.width().unwrap_or(0);
+        if width > max {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+/// 末尾から、幅が `max` 列を超えない分だけ取る。
+fn take_end(s: &str, max: usize) -> &str {
+    let mut width = 0;
+    for (i, c) in s.char_indices().rev() {
+        width += c.width().unwrap_or(0);
+        if width > max {
+            return &s[i + c.len_utf8()..];
+        }
+    }
+    s
 }
 
 /// パネルに入りきらなかった分を知らせる 1 行（「… 他 N 件」）。
