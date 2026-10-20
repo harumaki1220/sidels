@@ -41,6 +41,10 @@ enum AppEvent {
     ///
     /// 画面への書き込みはメインループだけが行うので、入力係から頼む。
     Copy(String),
+    /// 中のアプリが出した制御文字列を、外側のターミナルにそのまま送ってほしい。
+    ///
+    /// 今はクリップボードへの書き込み（OSC 52）だけ。出力係から頼む。
+    PassThrough(Vec<u8>),
 }
 
 fn main() -> Result<()> {
@@ -247,6 +251,7 @@ fn wait_for_event(rx: &Receiver<AppEvent>, visibility: &mut PanelVisibility) -> 
             // 読み込みが終わっただけでは描き直さない。中身が変わったかは panel.update が判断する
             AppEvent::PanelLoaded => {}
             AppEvent::Copy(text) => write_raw(&selection::osc52(&text))?,
+            AppEvent::PassThrough(bytes) => write_raw(&bytes)?,
             AppEvent::Exited => return Ok(Wake::Exited),
         }
     }
