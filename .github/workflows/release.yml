@@ -1,0 +1,60 @@
+name: Release
+
+# v1.0.0 のようなタグを push すると、ビルド済みのファイルを付けて GitHub の Release を作る。
+# すでにあるタグにも使えるよう、Actions の画面から手で動かすこともできる。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release を作るタグ（例: v1.0.0）"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      # タグと Cargo.toml のバージョンがずれていたら止める（バージョンの上げ忘れを防ぐ）
+      - name: Check version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$TAG" ]; then
+            echo "Cargo.toml のバージョン v$version とタグ $TAG が一致しません"
+            exit 1
+          fi
+
+      # musl で静的リンクすると、Ubuntu のバージョン（glibc）を問わず動く
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        run: |
+          strip "target/$TARGET/release/sidels"
+          tar czf sidels-x86_64-linux.tar.gz -C "target/$TARGET/release" sidels
+          sha256sum sidels-x86_64-linux.tar.gz > sidels-x86_64-linux.tar.gz.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="sidels-x86_64-linux.tar.gz sidels-x86_64-linux.tar.gz.sha256"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" $files --clobber
+          else
+            gh release create "$TAG" $files --title "$TAG" --generate-notes
+          fi

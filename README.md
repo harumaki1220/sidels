@@ -11,7 +11,14 @@ Git の管理下では、変更のあるファイルに `M` や `?` の印が付
 
 ## インストール
 
-Rust 1.88 以上と、C のリンカーが必要です（Ubuntu なら `sudo apt install build-essential`）。
+ビルド済みのファイルをダウンロードして、`~/.local/bin` などパスの通った場所に置きます。
+
+```sh
+curl -L https://github.com/harumaki1220/sidels/releases/latest/download/sidels-x86_64-linux.tar.gz | tar xz
+mv sidels ~/.local/bin/
+```
+
+Rust（1.88 以上）があれば、ソースからビルドすることもできます（C のリンカーも必要です。Ubuntu なら `sudo apt install build-essential`）。
 
 ```sh
 cargo install --locked --git https://github.com/harumaki1220/sidels
