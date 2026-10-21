@@ -2,13 +2,14 @@
 //!
 //! シェルの現在地の中身を表示し、入力中のコマンドラインに合わせて
 //! 移動先のプレビュー・絞り込み・glob ハイライトを行う。Git の管理下なら、変更のあるファイルに印を付ける。
+//! 最近書き換えられたファイルには、名前の後ろに ● を付ける。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use globset::{GlobBuilder, GlobMatcher};
 use ratatui::Frame;
@@ -35,6 +36,21 @@ const SWITCH_WAIT: Duration = Duration::from_millis(20);
 ///
 /// どのディレクトリを読んだかと、中身またはエラーメッセージ。
 type Loaded = (PathBuf, Result<Vec<Entry>, String>);
+
+/// この時間以内に書き換えられたファイルを「最近変わった」として ● を付ける。
+///
+/// Claude Code に頼んだ作業が終わってから確かめるくらいの間は残る長さにしている。
+const RECENT_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// 更新時刻を調べないディレクトリの、ファイル数の上限。
+///
+/// 更新時刻はファイルごとに問い合わせる必要があり、数が多いと時間がかかるため。
+const MTIME_MAX_ENTRIES: usize = 1000;
+
+/// 更新時刻係から届く結果。
+///
+/// どのディレクトリを調べたかと、ファイル名ごとの更新時刻（調べなかったなら `None`）。
+type MtimeLoaded = (PathBuf, Option<HashMap<String, SystemTime>>);
 
 /// Git 係から届く結果。
 ///
@@ -73,6 +89,16 @@ pub struct FilePanel {
     git_pending: bool,
     /// `dir` の Git の状態（ブランチと、ファイル名ごとの印）。Git の管理下でなければ `None`。
     git: Option<GitStatus>,
+    /// 更新時刻係への依頼。
+    mtime_tx: Sender<PathBuf>,
+    /// 更新時刻係からの結果。
+    mtime_rx: Receiver<MtimeLoaded>,
+    /// 更新時刻係に依頼して、まだ結果が届いていない。
+    mtime_pending: bool,
+    /// `dir` の中のファイル名ごとの更新時刻。調べていなければ `None`。
+    mtimes: Option<HashMap<String, SystemTime>>,
+    /// 最近（[`RECENT_WINDOW`] 以内に）書き換えられたファイルの名前。
+    recent: HashSet<String>,
     /// 最後に受け取ったコマンドライン。変わったときだけ glob を作り直す。
     command_line: String,
     /// コマンドライン中の glob のうち、`dir` を対象とするもの。
@@ -108,7 +134,9 @@ impl FilePanel {
         );
         // git status は遅いことがあるので、一覧の読み込みとは別のスレッドで調べる。
         // 同じスレッドだと、git status が終わるまで別のディレクトリへの切り替えが待たされる
-        let (git_tx, git_rx) = spawn_worker(git::status, on_loaded);
+        let (git_tx, git_rx) = spawn_worker(git::status, Arc::clone(&on_loaded));
+        // 更新時刻もファイルごとの問い合わせで遅いことがあるので、別のスレッドで調べる
+        let (mtime_tx, mtime_rx) = spawn_worker(read_mtimes, on_loaded);
         Self {
             shell_pid,
             cwd: start_dir.clone(),
@@ -125,6 +153,11 @@ impl FilePanel {
             git_rx,
             git_pending: false,
             git: None,
+            mtime_tx,
+            mtime_rx,
+            mtime_pending: false,
+            mtimes: None,
+            recent: HashSet::new(),
             command_line: String::new(),
             globs: Vec::new(),
             filter: String::new(),
@@ -182,6 +215,23 @@ impl FilePanel {
             let _ = self.git_tx.send(self.dir.clone());
         }
 
+        while let Ok((dir, mtimes)) = self.mtime_rx.try_recv() {
+            self.mtime_pending = false;
+            if dir == self.dir {
+                self.mtimes = mtimes;
+            }
+        }
+        if reloaded && !self.mtime_pending {
+            self.mtime_pending = true;
+            let _ = self.mtime_tx.send(self.dir.clone());
+        }
+        // 最近かどうかは毎回判定し直す（何もしなくても、時間がたてば ● が消えるように）
+        let recent = self.recent_names();
+        if recent != self.recent {
+            self.recent = recent;
+            listing_changed = true;
+        }
+
         // 絞り込みは wanted に対するものなので、まだ前の場所を表示している間はかけない
         self.filter = if self.wanted == self.dir {
             filter
@@ -224,7 +274,9 @@ impl FilePanel {
                 let mark_width = if self.git.is_some() { 2 } else { 0 };
                 let name_width = usize::from(inner.width).saturating_sub(mark_width);
                 let marks = self.git.as_ref().map(|git| &git.marks);
-                let item = |entry: &&Entry| entry.to_list_item(marks, name_width);
+                let item = |entry: &&Entry| {
+                    entry.to_list_item(marks, self.recent.contains(&entry.name), name_width)
+                };
                 let entries: Vec<&Entry> = self.visible_entries().collect();
                 if entries.len() <= rows {
                     entries.iter().map(item).collect()
@@ -295,12 +347,29 @@ impl FilePanel {
         if dir != self.dir {
             // 前の場所の印が、新しい場所の同じ名前のファイルに付かないように消しておく
             self.git = None;
+            self.mtimes = None;
         }
         self.dir = dir;
         self.last_refresh = Instant::now();
         self.entries = entries;
         self.error = error;
         (true, changed)
+    }
+
+    /// 最近（[`RECENT_WINDOW`] 以内に）書き換えられたファイルの名前。
+    fn recent_names(&self) -> HashSet<String> {
+        let Some(mtimes) = &self.mtimes else {
+            return HashSet::new();
+        };
+        let now = SystemTime::now();
+        mtimes
+            .iter()
+            .filter(|(_, mtime)| {
+                now.duration_since(**mtime)
+                    .is_ok_and(|age| age <= RECENT_WINDOW)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// 各ファイルが glob にマッチするかを付け直す。
@@ -343,12 +412,20 @@ impl Entry {
     /// パネルの 1 行にする。
     ///
     /// `git` は表示中のディレクトリの Git の印（Git の管理下でなければ `None`）。
+    /// `recent` なら名前の後ろに ● を付ける（最近書き換えられた）。
     /// 名前は `name_width` 列に収まるよう、長ければ真ん中を省略する。
     fn to_list_item(
         &self,
         git: Option<&HashMap<String, GitMark>>,
+        recent: bool,
         name_width: usize,
     ) -> ListItem<'static> {
+        // ● の 2 列（空白と ●）の分だけ、名前を短くする
+        let name_width = if recent {
+            name_width.saturating_sub(2)
+        } else {
+            name_width
+        };
         let text = fit_name(&self.name, self.is_dir, name_width);
         let style = if self.is_dir {
             Style::default()
@@ -367,19 +444,22 @@ impl Entry {
         } else {
             style
         };
-        let name = Span::styled(text, style);
-        let Some(marks) = git else {
-            return ListItem::new(Line::from(name));
-        };
+        let mut spans = Vec::new();
         // Git の管理下では、名前の位置を揃えるため、印がなくても 2 列空ける
-        let mark = match marks.get(&self.name) {
-            Some(mark) => Span::styled(
-                format!("{} ", mark.letter),
-                Style::default().fg(mark_color(mark.kind)),
-            ),
-            None => Span::raw("  "),
-        };
-        ListItem::new(Line::from(vec![mark, name]))
+        if let Some(marks) = git {
+            spans.push(match marks.get(&self.name) {
+                Some(mark) => Span::styled(
+                    format!("{} ", mark.letter),
+                    Style::default().fg(mark_color(mark.kind)),
+                ),
+                None => Span::raw("  "),
+            });
+        }
+        spans.push(Span::styled(text, style));
+        if recent {
+            spans.push(Span::styled(" ●", Style::default().fg(Color::Cyan)));
+        }
+        ListItem::new(Line::from(spans))
     }
 }
 
@@ -493,6 +573,33 @@ fn mark_color(kind: GitKind) -> Color {
 fn process_cwd(pid: Option<u32>) -> Option<PathBuf> {
     let pid = pid?;
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// ディレクトリの中のファイル名ごとの更新時刻。
+///
+/// Windows 側のフォルダ（`/mnt/` の下）と、ファイルが [`MTIME_MAX_ENTRIES`] を超えるディレクトリでは調べない
+/// （ファイルごとの問い合わせが遅く、/mnt/c の大きなフォルダでは数秒かかるため）。
+/// `.git` は Git の操作のたびに書き換わって、いつも ● が付いてしまうので除く。
+fn read_mtimes(dir: &Path) -> Option<HashMap<String, SystemTime>> {
+    if dir.starts_with("/mnt") {
+        return None;
+    }
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .collect();
+    if entries.len() > MTIME_MAX_ENTRIES {
+        return None;
+    }
+    let mtimes = entries
+        .iter()
+        .filter(|entry| entry.file_name() != ".git")
+        .filter_map(|entry| {
+            let mtime = entry.metadata().ok()?.modified().ok()?;
+            Some((entry.file_name().to_string_lossy().into_owned(), mtime))
+        })
+        .collect();
+    Some(mtimes)
 }
 
 /// 依頼されたディレクトリを裏で調べる係のスレッドを立てる。
