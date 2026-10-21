@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::git::{self, GitKind, GitMark};
+use crate::git::{self, Branch, GitKind, GitMark, GitStatus};
 
 /// 同じディレクトリを読み直す間隔。
 ///
@@ -38,8 +38,8 @@ type Loaded = (PathBuf, Result<Vec<Entry>, String>);
 
 /// Git 係から届く結果。
 ///
-/// どのディレクトリを調べたかと、ファイル名ごとの印（Git の管理下でなければ `None`）。
-type GitLoaded = (PathBuf, Option<HashMap<String, GitMark>>);
+/// どのディレクトリを調べたかと、その Git の状態（Git の管理下でなければ `None`）。
+type GitLoaded = (PathBuf, Option<GitStatus>);
 
 /// 右側のファイル一覧パネル。
 pub struct FilePanel {
@@ -71,8 +71,8 @@ pub struct FilePanel {
     ///
     /// 大きなリポジトリでは `git status` が遅いので、終わる前に次を頼まない。
     git_pending: bool,
-    /// `dir` の中のファイル名ごとの Git の印。Git の管理下でなければ `None`。
-    git: Option<HashMap<String, GitMark>>,
+    /// `dir` の Git の状態（ブランチと、ファイル名ごとの印）。Git の管理下でなければ `None`。
+    git: Option<GitStatus>,
     /// 最後に受け取ったコマンドライン。変わったときだけ glob を作り直す。
     command_line: String,
     /// コマンドライン中の glob のうち、`dir` を対象とするもの。
@@ -204,9 +204,13 @@ impl FilePanel {
 
     /// パネルを `area` に描く。
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let mut title = vec![Span::raw(format!(" {} ", self.title()))];
+        if let Some(git) = &self.git {
+            title.extend(branch_spans(&git.branch));
+        }
         let block = Block::default()
             .borders(Borders::LEFT)
-            .title(format!(" {} ", self.title()));
+            .title(Line::from(title));
 
         let items: Vec<ListItem> = match &self.error {
             Some(message) => vec![ListItem::new(Line::styled(
@@ -219,7 +223,8 @@ impl FilePanel {
                 // Git の印の 2 列を除いた、名前に使える幅
                 let mark_width = if self.git.is_some() { 2 } else { 0 };
                 let name_width = usize::from(inner.width).saturating_sub(mark_width);
-                let item = |entry: &&Entry| entry.to_list_item(self.git.as_ref(), name_width);
+                let marks = self.git.as_ref().map(|git| &git.marks);
+                let item = |entry: &&Entry| entry.to_list_item(marks, name_width);
                 let entries: Vec<&Entry> = self.visible_entries().collect();
                 if entries.len() <= rows {
                     entries.iter().map(item).collect()
@@ -444,6 +449,32 @@ fn overflow_item(hidden: &[&Entry]) -> ListItem<'static> {
         ));
     }
     ListItem::new(Line::from(spans))
+}
+
+/// 見出しの後ろに付けるブランチの表示（`main ↑2↓1`）。
+///
+/// リモートとの差がなければ矢印は出さない。ブランチに入っていなければ `(detached)`。
+fn branch_spans(branch: &Branch) -> Vec<Span<'static>> {
+    let name = branch
+        .name
+        .clone()
+        .unwrap_or_else(|| "(detached)".to_string());
+    let mut spans = vec![Span::styled(name, Style::default().fg(Color::Magenta))];
+    if branch.ahead > 0 {
+        spans.push(Span::styled(
+            format!(" ↑{}", branch.ahead),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    if branch.behind > 0 {
+        let gap = if branch.ahead > 0 { "" } else { " " };
+        spans.push(Span::styled(
+            format!("{gap}↓{}", branch.behind),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    spans.push(Span::raw(" "));
+    spans
 }
 
 /// Git の印の色。`git status` の色分けに合わせ、`git add` 済みは緑、まだの変更は黄色にする。

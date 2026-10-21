@@ -1,6 +1,7 @@
 //! Git の状態。
 //!
 //! パネルに表示しているディレクトリの各ファイルに、変更がある・新しい・`git add` 済み、などの印を付ける。
+//! 今のブランチと、リモートとのコミットの差も調べる。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,14 +31,64 @@ pub struct GitMark {
     pub letter: char,
 }
 
-/// `dir` の中のファイル名ごとの印。
-///
-/// `dir` が Git の管理下でなければ `None`。サブディレクトリは、中に変更があればその名前に印が付く。
-pub fn status(dir: &Path) -> Option<HashMap<String, GitMark>> {
+/// ディレクトリの Git の状態。
+#[derive(Clone, PartialEq, Eq)]
+pub struct GitStatus {
+    /// 今のブランチ。
+    pub branch: Branch,
+    /// ファイル名ごとの印。サブディレクトリは、中に変更があればその名前に印が付く。
+    pub marks: HashMap<String, GitMark>,
+}
+
+/// 今のブランチと、リモート（upstream）とのコミットの差。
+#[derive(Clone, PartialEq, Eq)]
+pub struct Branch {
+    /// ブランチ名。ブランチに入っていない（detached HEAD）なら `None`。
+    pub name: Option<String>,
+    /// まだ push していないコミットの数。
+    pub ahead: u32,
+    /// リモートにあって、まだ取り込んでいないコミットの数（最後に fetch した時点）。
+    pub behind: u32,
+}
+
+/// `dir` の Git の状態。`dir` が Git の管理下でなければ `None`。
+pub fn status(dir: &Path) -> Option<GitStatus> {
     // リポジトリの一番上から見た dir の位置（"src/" など）。status のパスはここからの相対になる
     let prefix = git(dir, &["rev-parse", "--show-prefix"])?;
-    let output = git(dir, &["status", "--porcelain=v1", "-z", "--", "."])?;
-    Some(parse(&output, prefix.trim_end_matches('\n')))
+    // -b を付けると、最初の 1 件がブランチの情報（`## main...origin/main [ahead 1]`）になる
+    let output = git(dir, &["status", "--porcelain=v1", "-b", "-z", "--", "."])?;
+    let (header, rest) = output.split_once('\0').unwrap_or((&output, ""));
+    Some(GitStatus {
+        branch: parse_branch(header.strip_prefix("## ").unwrap_or_default()),
+        marks: parse(rest, prefix.trim_end_matches('\n')),
+    })
+}
+
+/// `git status -b` の 1 件目（`## ` の後ろ）から、ブランチ名とコミットの差を読む。
+///
+/// 形は `main...origin/main [ahead 2, behind 1]`、upstream がなければ `main`、
+/// まだコミットがなければ `No commits yet on main`、detached HEAD なら `HEAD (no branch)`。
+fn parse_branch(header: &str) -> Branch {
+    let (names, counts) = header.split_once(" [").unwrap_or((header, ""));
+    let name = if names == "HEAD (no branch)" {
+        None
+    } else {
+        let names = names.strip_prefix("No commits yet on ").unwrap_or(names);
+        let name = names.split_once("...").map_or(names, |(local, _)| local);
+        Some(name.to_string())
+    };
+    let count = |label: &str| {
+        counts
+            .trim_end_matches(']')
+            .split(", ")
+            .find_map(|part| part.strip_prefix(label)?.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    Branch {
+        name,
+        ahead: count("ahead"),
+        behind: count("behind"),
+    }
 }
 
 /// `dir` で git コマンドを実行し、成功したら標準出力を返す。
