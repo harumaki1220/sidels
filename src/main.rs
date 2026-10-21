@@ -107,7 +107,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
     // パネルはディレクトリを別スレッドで読む。読み終わったら描き直しを頼む
     let panel_tx = tx.clone();
-    let mut panel = FilePanel::new(child.process_id(), std::env::current_dir()?, move || {
+    let shell_pid = child.process_id();
+    let mut panel = FilePanel::new(shell_pid, std::env::current_dir()?, move || {
         let _ = panel_tx.send(AppEvent::PanelLoaded);
     });
 
@@ -174,8 +175,17 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         // 履歴をさかのぼっている間は画面に入力中の行が映っていないので、パネルは直前のまま
         let scrolled = parser.lock().unwrap().screen().scrollback() > 0;
         if panel_visible && !scrolled {
-            let (line, word) = read_input(&parser.lock().unwrap());
-            needs_draw |= panel.update(&line, &word);
+            // 今キー入力を受け取っているプログラム（前面のプロセスグループ）。普段はシェル
+            let foreground = master
+                .process_group_leader()
+                .and_then(|pid| u32::try_from(pid).ok());
+            // シェル以外（Claude Code など）が前面のときは、打っている文字はコマンドではないので反応しない
+            let (line, word) = if foreground.is_none() || foreground == shell_pid {
+                read_input(&parser.lock().unwrap())
+            } else {
+                (String::new(), String::new())
+            };
+            needs_draw |= panel.update(foreground, &line, &word);
         }
 
         if needs_draw {

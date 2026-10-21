@@ -43,9 +43,9 @@ type GitLoaded = (PathBuf, Option<HashMap<String, GitMark>>);
 
 /// 右側のファイル一覧パネル。
 pub struct FilePanel {
-    /// シェルのプロセス番号。今いるディレクトリを調べるのに使う。
+    /// シェルのプロセス番号。前面のプログラムの場所が分からないときに、代わりに場所を調べる。
     shell_pid: Option<u32>,
-    /// シェルが今いるディレクトリ。
+    /// 前面のプログラム（普段はシェル）が今いるディレクトリ。
     cwd: PathBuf,
     /// 表示したいディレクトリ。打ちかけのパスがあればその先、なければ `cwd`。
     wanted: PathBuf,
@@ -131,16 +131,19 @@ impl FilePanel {
         }
     }
 
-    /// シェルの現在地と入力中のコマンドラインから、表示するディレクトリ・絞り込み・ハイライトを決める。
+    /// 前面のプログラムの現在地と入力中のコマンドラインから、表示するディレクトリ・絞り込み・ハイライトを決める。
     ///
+    /// `foreground` はターミナルの前面で動いているプログラムのプロセス番号（普段はシェル）。
+    /// シェルの中で起動した Claude Code が worktree に移ったときなども、パネルが追いかけられる。
     /// `line` はカーソル行全体、`word` はカーソル直前の打ちかけの単語。
     /// 表示が変わったら `true` を返す（変わっていなければ描き直さなくてよい）。
-    pub fn update(&mut self, line: &str, word: &str) -> bool {
+    pub fn update(&mut self, foreground: Option<u32>, line: &str, word: &str) -> bool {
         let title_before = self.title();
         let filter_before = self.filter.clone();
         let mut listing_changed = false;
 
-        if let Some(cwd) = self.shell_cwd() {
+        // 前面のプログラムが終わった直後などで場所を読めなければ、シェルの場所を使う
+        if let Some(cwd) = process_cwd(foreground).or_else(|| process_cwd(self.shell_pid)) {
             self.cwd = cwd;
         }
         let (wanted, filter) = self.target(word);
@@ -264,14 +267,6 @@ impl FilePanel {
         self.entries
             .iter()
             .filter(move |e| !any_match || e.name.starts_with(&self.filter))
-    }
-
-    /// シェルが今いるディレクトリ。
-    ///
-    /// Linux では `/proc/<pid>/cwd` が、そのプロセスが今いるディレクトリへのリンクになっている。
-    fn shell_cwd(&self) -> Option<PathBuf> {
-        let pid = self.shell_pid?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
     /// 読み込み係からの結果を反映する。
@@ -459,6 +454,14 @@ fn mark_color(kind: GitKind) -> Color {
         GitKind::Modified => Color::Yellow,
         GitKind::Conflict => Color::Magenta,
     }
+}
+
+/// プロセスが今いるディレクトリ。
+///
+/// Linux では `/proc/<pid>/cwd` が、そのプロセスが今いるディレクトリへのリンクになっている。
+fn process_cwd(pid: Option<u32>) -> Option<PathBuf> {
+    let pid = pid?;
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
 /// 依頼されたディレクトリを裏で調べる係のスレッドを立てる。
