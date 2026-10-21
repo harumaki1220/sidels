@@ -44,6 +44,9 @@ const SPECIAL_KEYS: &[(&[u8], SpecialKey)] = &[
     (b"\x1b[1;2B", SpecialKey::Scroll(ScrollStep::LinesDown)),
 ];
 
+/// Ctrl+C を押したときに届くバイト。
+const CTRL_C: u8 = 0x03;
+
 /// Shift+↑ / Shift+↓ やホイールで一度に動かす行数。
 const SCROLL_LINES: usize = 3;
 
@@ -111,6 +114,16 @@ pub fn spawn_input_thread(
                         }
                     }
                     if input.is_empty() {
+                        continue;
+                    }
+                    // 選択しているときの Ctrl+C は、中断ではなくコピーにする（Windows Terminal などと同じ）
+                    if input == [CTRL_C]
+                        && let Some(event) = copy_selection(&parser, &selection)
+                    {
+                        // 選択を外したので描き直す
+                        if tx.send(event).is_err() || tx.send(AppEvent::Output).is_err() {
+                            return;
+                        }
                         continue;
                     }
                     if clear_selection(&selection) {
@@ -203,7 +216,7 @@ fn handle_mouse(
             event.row.clamp(1, rows.max(1)) - 1,
             event.col.clamp(1, cols.max(1)) - 1,
         );
-        return handle_selection(event, in_shell, pos, parser, selection);
+        return handle_selection(event, in_shell, pos, selection);
     }
 
     if !event.is_wheel() || !in_shell {
@@ -235,40 +248,41 @@ fn handle_mouse(
 
 /// 左ボタンでの選択。
 ///
-/// 押すと始まり、ドラッグで広げ、離したら選んだ文字をコピーする。
+/// 押すと始まり、ドラッグで広げる。離しても選択は残し、Ctrl+C でコピーする（[`copy_selection`]）。
 /// 何も選ばずに離した（クリックしただけ）なら選択を外す。
 fn handle_selection(
     event: MouseEvent,
     in_shell: bool,
     pos: (u16, u16),
+    selection: &Mutex<Option<Selection>>,
+) -> Option<AppEvent> {
+    let mut current = selection.lock().unwrap();
+    if event.pressed && !event.is_motion() {
+        // パネルの上で押したときは、選択を外すだけ
+        *current = in_shell.then(|| Selection::new(pos));
+        return Some(AppEvent::Output);
+    }
+    let selected = current.as_mut()?;
+    selected.extend(pos);
+    if !event.pressed && selected.is_empty() {
+        *current = None;
+    }
+    Some(AppEvent::Output)
+}
+
+/// 選択している文字をコピーして、選択を外す。
+///
+/// 選択していなければ `None`（そのときの Ctrl+C は、中断としてシェルに渡す）。
+fn copy_selection(
     parser: &Mutex<vt100::Parser>,
     selection: &Mutex<Option<Selection>>,
 ) -> Option<AppEvent> {
-    let finished = {
-        let mut current = selection.lock().unwrap();
-        if event.pressed && !event.is_motion() {
-            // パネルの上で押したときは、選択を外すだけ
-            *current = in_shell.then(|| Selection::new(pos));
-            return Some(AppEvent::Output);
-        }
-        let selected = current.as_mut()?;
-        selected.extend(pos);
-        if event.pressed {
-            return Some(AppEvent::Output);
-        }
-        if selected.is_empty() {
-            *current = None;
-            return Some(AppEvent::Output);
-        }
-        *selected
-    };
     // 選択のロックを外してから仮想端末をロックする（描画側と順番が逆になるとデッドロックする）
-    let text = finished.text(parser.lock().unwrap().screen());
-    // 何も書かれていない場所を選んだだけなら、コピーせずに選択を外す。
+    let selected = selection.lock().unwrap().take()?;
+    let text = selected.text(parser.lock().unwrap().screen());
+    // 何も書かれていない場所を選んだだけなら、コピーしない。
     // 空の文字をコピーすると、クリップボードに入っていた中身が消えてしまう
-    // （ウィンドウを選ぶつもりのクリックで、マウスが少し動いただけでも起きる）
     if text.trim().is_empty() {
-        clear_selection(selection);
         return Some(AppEvent::Output);
     }
     Some(AppEvent::Copy(text))
