@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::git::{self, GitKind, GitMark, GitStatus};
+use crate::git::{self, GitKind, GitStatus};
 
 /// 同じディレクトリを読み直す間隔。
 ///
@@ -271,9 +271,9 @@ impl FilePanel {
                 // Git の印の 2 列を除いた、名前に使える幅
                 let mark_width = if self.git.is_some() { 2 } else { 0 };
                 let name_width = usize::from(inner.width).saturating_sub(mark_width);
-                let marks = self.git.as_ref().map(|git| &git.marks);
+                let git = self.git.as_ref();
                 let item = |entry: &&Entry| {
-                    entry.to_list_item(marks, self.recent.contains(&entry.name), name_width)
+                    entry.to_list_item(git, self.recent.contains(&entry.name), name_width)
                 };
                 let deleted = self.deleted_entries();
                 let entries = self.visible_entries(&deleted);
@@ -479,14 +479,31 @@ impl Entry {
         self.name.starts_with('.')
     }
 
+    /// 普段は見なくていいもの（薄く表示する）か。
+    ///
+    /// Git の管理下では「Git で管理していなくて、新しいファイルの印（`?`）も付いていないもの」、
+    /// つまり Git が無視しているもの（`node_modules/` `target/` など）と `.git/`。
+    /// `.github/` や `.gitignore` のように `.` で始まっていても、管理しているものは薄くしない。
+    /// Git の管理下でなければ、`.` で始まるもの（ホームの `.cache/` `.config/` など）。
+    fn is_unimportant(&self, git: Option<&GitStatus>) -> bool {
+        match git {
+            Some(git) => {
+                !self.deleted
+                    && !git.tracked.contains(&self.name)
+                    && !git.marks.contains_key(&self.name)
+            }
+            None => self.is_hidden(),
+        }
+    }
+
     /// パネルの 1 行にする。
     ///
-    /// `git` は表示中のディレクトリの Git の印（Git の管理下でなければ `None`）。
+    /// `git` は表示中のディレクトリの Git の状態（Git の管理下でなければ `None`）。
     /// `recent` なら名前の後ろに ● を付ける（最近書き換えられた）。
     /// 名前は `name_width` 列に収まるよう、長ければ真ん中を省略する。
     fn to_list_item(
         &self,
-        git: Option<&HashMap<String, GitMark>>,
+        git: Option<&GitStatus>,
         recent: bool,
         name_width: usize,
     ) -> ListItem<'static> {
@@ -504,7 +521,7 @@ impl Entry {
         } else {
             Style::default()
         };
-        let style = if self.is_hidden() {
+        let style = if self.is_unimportant(git) {
             style.add_modifier(Modifier::DIM)
         } else {
             style
@@ -524,8 +541,8 @@ impl Entry {
         };
         let mut spans = Vec::new();
         // Git の管理下では、名前の位置を揃えるため、印がなくても 2 列空ける
-        if let Some(marks) = git {
-            spans.push(match marks.get(&self.name) {
+        if let Some(git) = git {
+            spans.push(match git.marks.get(&self.name) {
                 Some(mark) => Span::styled(
                     format!("{} ", mark.letter),
                     Style::default().fg(mark_color(mark.kind)),

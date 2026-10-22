@@ -3,7 +3,7 @@
 //! パネルに表示しているディレクトリの各ファイルに、変更がある・新しい・`git add` 済み、などの印を付ける。
 //! 今のブランチと、リモートとのコミットの差も調べる。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -38,6 +38,8 @@ pub struct GitStatus {
     pub branch: Branch,
     /// ファイル名ごとの印。サブディレクトリは、中に変更があればその名前に印が付く。
     pub marks: HashMap<String, GitMark>,
+    /// 直下にあるもののうち、Git で管理している（最後のコミットに入っている）ものの名前。
+    pub tracked: HashSet<String>,
 }
 
 /// 今のブランチと、リモート（upstream）とのコミットの差。
@@ -58,9 +60,20 @@ pub fn status(dir: &Path) -> Option<GitStatus> {
     // -b を付けると、最初の 1 件がブランチの情報（`## main...origin/main [ahead 1]`）になる
     let output = git(dir, &["status", "--porcelain=v1", "-b", "-z", "--", "."])?;
     let (header, rest) = output.split_once('\0').unwrap_or((&output, ""));
+    // 直下で管理しているものの名前。まだコミットがなければ HEAD がないので空にする
+    let tracked = git(dir, &["ls-tree", "--name-only", "-z", "HEAD"])
+        .map(|names| {
+            names
+                .split('\0')
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     Some(GitStatus {
         branch: parse_branch(header.strip_prefix("## ").unwrap_or_default()),
         marks: parse(rest, prefix.trim_end_matches('\n')),
+        tracked,
     })
 }
 
