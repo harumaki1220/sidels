@@ -20,7 +20,7 @@ cd のたびに ls を打つ手間をなくすのが目的。Rust 製。
 - tmux の領域: 画像表示、リンクのクリック、タブや画面分割、セッションの保持
 - ファイルマネージャーの領域: パネルからの削除・リネーム・コピー
 - 設定ファイル（v1.0 ではパネル幅などを定数で固定）
-- Linux / WSL 以外の OS（`/proc` に依存）
+- Windows のネイティブ環境（PTY が違う。WSL で使ってもらう）
 
 ## v1.1 以降の候補
 
@@ -58,7 +58,7 @@ cd のたびに ls を打つ手間をなくすのが目的。Rust 製。
 - 裏で動かす git には `GIT_OPTIONAL_LOCKS=0` を付ける（付けないと index.lock を取り、ユーザーの git commit などが失敗することがある）
 - 空の文字はコピーしない（クリップボードの中身が消える）
 - vt100 は OSC 52（クリップボードへの書き込み）を捨てるので、出力係が拾って外側のターミナルに伝える。伝えないと、Claude Code や vim で選択・コピーしてもクリップボードに入らない。クリップボードを読ませる問い合わせは伝えない
-- パネルが追いかけるのは、シェルではなく前面のプログラム（PTY の前面のプロセスグループ）の `/proc/<pid>/cwd`。シェルの中で起動した Claude Code が worktree に移ると、そのプロセスの cwd も変わるので追いかけられる。前面がシェル以外のときは、打っている文字はコマンドではないので入力に反応しない
+- パネルが追いかけるのは、シェルではなく前面のプログラム（PTY の前面のプロセスグループ）の今いる場所（Linux は `/proc/<pid>/cwd`、macOS は `proc_pidinfo`）。シェルの中で起動した Claude Code が worktree に移ると、そのプロセスの cwd も変わるので追いかけられる。前面がシェル以外のときは、打っている文字はコマンドではないので入力に反応しない
 - 画面への書き込みはメインループだけが行う（入力係が書くと描画中の制御文字列と混ざる）
 
 ## 依存
@@ -69,13 +69,13 @@ anyhow / crossterm 0.29 / globset 0.4 / portable-pty 0.9 / ratatui 0.30 / tui-te
 ## 未対応・既知の制限
 
 - ダブルクリックでの単語選択（v1.1 以降）
-- `/proc` を使うので Linux（WSL 含む）専用
+- macOS は CI でのビルドとテストだけで、実機ではあまり試せていない
 
 ## 開発の進め方
 
 - 動作確認は手動（`cargo run` して実際に触る）。変更後は最低限 `cargo build` と `cargo clippy` が通ること
 - push すると CI（`.github/workflows/ci.yml`）が `cargo fmt --check`、`cargo clippy -- -D warnings`（警告もエラー扱い）、build、test と、Rust 1.88 でのビルドを確かめる。コミット前に `cargo fmt` をかけておく
-- リリース: `Cargo.toml` の `version` を上げてコミットし、`vX.Y.Z` のタグを push する。`.github/workflows/release.yml` が x86_64 と aarch64（ARM のマシンで直接）向けに musl で静的リンクしたファイルをビルドして GitHub の Release に置く（タグと `version` がずれていると止まる）
+- リリース: `Cargo.toml` の `version` を上げてコミットし、`vX.Y.Z` のタグを push する。`.github/workflows/release.yml` が Linux（x86_64 と aarch64、musl で静的リンク）と macOS（arm64 と x86_64）向けのファイルをビルドして GitHub の Release に置く（タグと `version` がずれていると止まる）
 - コミットメッセージは英語の Conventional Commits（`feat:` `fix:` `refactor:` など、続きは小文字始まり）
 - 変更するときは、何をなぜ変えたかを短く説明すること
 - コメントは「なぜ」を書く。名前を読めば分かることは書かない

@@ -10,8 +10,12 @@ env:
 
 jobs:
   check:
-    name: fmt / clippy / build / test
-    runs-on: ubuntu-latest
+    name: fmt / clippy / build / test (${{ matrix.os }})
+    # macOS は今いるディレクトリの取り方が違う（/proc がない）ので、別のコードが通るか確かめる
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

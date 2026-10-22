@@ -9,14 +9,15 @@ Git が無視しているもの（`node_modules/` など）は薄く表示しま
 
 中で動くのはいつものシェル（`$SHELL`）なので、設定やキー操作はそのまま使えます。
 
-> Linux（WSL 含む）専用です。x86_64 と ARM（aarch64）に対応しています。
+> Linux（WSL 含む）と macOS で動きます。x86_64 と ARM（Apple Silicon を含む）に対応しています。
+> macOS はまだあまり試せていません。
 
 ## インストール
 
-ビルド済みのファイルをダウンロードして、`~/.local/bin` などパスの通った場所に置きます（`uname -m` で PC の種類に合ったファイルを選びます）。
+ビルド済みのファイルをダウンロードして、`~/.local/bin` などパスの通った場所に置きます（`uname` で OS と PC の種類に合ったファイルを選びます）。
 
 ```sh
-curl -L https://github.com/harumaki1220/sidels/releases/latest/download/sidels-$(uname -m)-linux.tar.gz | tar xz
+curl -L https://github.com/harumaki1220/sidels/releases/latest/download/sidels-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
 mv sidels ~/.local/bin/
 ```
 
@@ -32,13 +33,14 @@ cargo install --locked --git https://github.com/harumaki1220/sidels
 
 | 操作 | 動き |
 |---|---|
-| F12 | パネルの出し入れ（狭いウィンドウでは自動で隠れる） |
+| F12 | パネルの出し入れ（狭いウィンドウでは自動で隠れる。Mac では fn+F12） |
 | ホイール / Shift+↑↓ | 過去の出力をスクロール |
 | ドラッグ → Ctrl+C | シェル側だけを選択してコピー（選択していないときの Ctrl+C は、いつもどおり中断） |
 
 ## 気をつけること
 
 - マウス操作を受け取るので、Windows Terminal の右クリック貼り付けは効きません（Ctrl+V は使えます）
+- 選択したもののコピーには、ターミナルの OSC 52 への対応が必要です（macOS 標準の Terminal.app は非対応です。iTerm2 や Ghostty では使えます）
 - 入力中の内容は画面から読み取っているので、zsh-autosuggestions の灰色の候補にも反応することがあります
 
 ## ライセンス

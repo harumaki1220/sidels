@@ -17,3 +17,7 @@ ratatui = "0.30"
 tui-term = "0.3.4"
 unicode-width = "0.2.2"
 vt100 = "0.16"
+
+# macOS には /proc がないので、プロセスの今いるディレクトリを proc_pidinfo で調べる
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.190"

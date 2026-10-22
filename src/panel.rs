@@ -657,9 +657,46 @@ fn mark_color(kind: GitKind) -> Color {
 /// プロセスが今いるディレクトリ。
 ///
 /// Linux では `/proc/<pid>/cwd` が、そのプロセスが今いるディレクトリへのリンクになっている。
+#[cfg(not(target_os = "macos"))]
 fn process_cwd(pid: Option<u32>) -> Option<PathBuf> {
     let pid = pid?;
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// プロセスが今いるディレクトリ。
+///
+/// macOS には `/proc` がないので、`lsof` と同じく `proc_pidinfo` に尋ねる。
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: Option<u32>) -> Option<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::unix::ffi::OsStrExt;
+
+    let pid = libc::c_int::try_from(pid?).ok()?;
+    let size = size_of::<libc::proc_vnodepathinfo>();
+    let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    // SAFETY: 渡すバッファは proc_vnodepathinfo 1 つ分の大きさで、その大きさも一緒に伝えている
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            libc::c_int::try_from(size).ok()?,
+        )
+    };
+    // 失敗（プロセスが終わった、権限がない）すると 0 以下か、書いた大きさが足りない
+    if usize::try_from(written).ok()? < size {
+        return None;
+    }
+    // SAFETY: zeroed で初期化済みで、上で全体が書き込まれたことも確かめた
+    let info = unsafe { info.assume_init() };
+    // libc では古い Rust のために [[c_char; 32]; 32] になっているが、中身は続いた 1 本の C 文字列
+    let raw = &info.pvi_cdir.vip_path;
+    // SAFETY: raw は size_of_val(raw) バイトの初期化済みの配列で、c_char は 1 バイト
+    let bytes = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), size_of_val(raw)) };
+    let path = CStr::from_bytes_until_nul(bytes).ok()?.to_bytes();
+    (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path)))
 }
 
 /// ディレクトリの中のファイル名ごとの更新時刻。

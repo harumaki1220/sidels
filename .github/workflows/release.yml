@@ -19,20 +19,31 @@ env:
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
-  # CPU の種類ごとに、そのマシンで直接ビルドする（ARM 向けも ARM のマシンで作るので、特別な設定が要らない）
+  # OS と CPU の種類ごとにビルドする。ファイル名は `uname -m` と `uname -s` の結果に合わせ、
+  # README の 1 行（sidels-$(uname -m)-$(uname -s | tr A-Z a-z)）でどの PC でも選べるようにする
   build:
     strategy:
       matrix:
         include:
-          - arch: x86_64
+          # Linux は musl で静的リンクすると、ディストリビューションやバージョン（glibc）を問わず動く。
+          # ARM 向けも ARM のマシンで直接ビルドするので、特別な設定が要らない
+          - target: x86_64-unknown-linux-musl
+            asset: sidels-x86_64-linux
             runner: ubuntu-latest
-          - arch: aarch64
+          - target: aarch64-unknown-linux-musl
+            asset: sidels-aarch64-linux
             runner: ubuntu-24.04-arm
+          # macOS は Apple Silicon のマシンで、Intel 向けも一緒に作れる
+          - target: aarch64-apple-darwin
+            asset: sidels-arm64-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            asset: sidels-x86_64-darwin
+            runner: macos-latest
     runs-on: ${{ matrix.runner }}
     env:
-      # musl で静的リンクすると、Linux のディストリビューションやバージョン（glibc）を問わず動く
-      TARGET: ${{ matrix.arch }}-unknown-linux-musl
-      ASSET: sidels-${{ matrix.arch }}-linux.tar.gz
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}.tar.gz
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,11 +67,12 @@ jobs:
         run: |
           strip "target/$TARGET/release/sidels"
           tar czf "$ASSET" -C "target/$TARGET/release" sidels
-          sha256sum "$ASSET" > "$ASSET.sha256"
+          # macOS には sha256sum がないので、どちらにもある shasum を使う
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.arch }}
+          name: ${{ matrix.asset }}
           path: sidels-*
 
   # 全部のビルドが終わってから、Release を 1 回だけ作る（並べて作ると、同時に作ろうとしてぶつかる）

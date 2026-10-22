@@ -1315,6 +1315,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "globset",
+ "libc",
  "portable-pty",
  "ratatui",
  "tui-term",
