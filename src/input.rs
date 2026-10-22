@@ -10,6 +10,7 @@ use std::thread;
 use crate::AppEvent;
 use crate::mouse::{self, MouseEvent};
 use crate::selection::{Selection, SharedSelection};
+use crate::shell::Parser;
 
 /// sidels が横取りするキー。
 ///
@@ -62,7 +63,7 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// キーボードとマウスの入力をシェルに渡す。sidels のキーとマウス操作だけは抜き取って自分で処理する。
 pub fn spawn_input_thread(
     mut writer: Box<dyn Write + Send>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<Parser>>,
     selection: SharedSelection,
     tx: Sender<AppEvent>,
 ) {
@@ -184,7 +185,7 @@ fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey
 /// - パネルの上でのそれ以外の操作: 何もしない
 fn handle_mouse(
     event: MouseEvent,
-    parser: &Mutex<vt100::Parser>,
+    parser: &Mutex<Parser>,
     selection: &Mutex<Option<Selection>>,
     writer: &mut Box<dyn Write + Send>,
 ) -> Option<AppEvent> {
@@ -274,7 +275,7 @@ fn handle_selection(
 ///
 /// 選択していなければ `None`（そのときの Ctrl+C は、中断としてシェルに渡す）。
 fn copy_selection(
-    parser: &Mutex<vt100::Parser>,
+    parser: &Mutex<Parser>,
     selection: &Mutex<Option<Selection>>,
 ) -> Option<AppEvent> {
     // 選択のロックを外してから仮想端末をロックする（描画側と順番が逆になるとデッドロックする）
@@ -312,7 +313,7 @@ fn remove_all(input: &[u8], needle: &[u8]) -> Vec<u8> {
 /// 履歴をさかのぼる・進める。
 ///
 /// 履歴の範囲を超えないようにするのは vt100 がやってくれる。
-fn scroll(parser: &Mutex<vt100::Parser>, step: ScrollStep) {
+fn scroll(parser: &Mutex<Parser>, step: ScrollStep) {
     let mut parser = parser.lock().unwrap();
     let screen = parser.screen_mut();
     let half_page = usize::from(screen.size().0 / 2).max(1);

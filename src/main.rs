@@ -25,7 +25,7 @@ use input::spawn_input_thread;
 use layout::{PanelVisibility, pty_size_for, split};
 use panel::FilePanel;
 use selection::SharedSelection;
-use shell::{SCROLLBACK_LINES, read_input, resize, spawn_output_thread};
+use shell::{Parser, Relay, SCROLLBACK_LINES, read_input, resize, spawn_output_thread};
 
 /// ウィンドウの大きさが変わってから、シェル側の大きさを合わせるまで待つ時間。
 ///
@@ -113,10 +113,11 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     });
 
     // シェルの出力を解釈して今の画面をメモリ上に持つ仮想端末
-    let parser = Arc::new(Mutex::new(vt100::Parser::new(
+    let parser = Arc::new(Mutex::new(Parser::new_with_callbacks(
         pty_size.rows,
         pty_size.cols,
         SCROLLBACK_LINES,
+        Relay::new(tx.clone()),
     )));
 
     // シェル側の文字選択。入力係（マウス）が書き換え、描画で反転表示する
@@ -207,7 +208,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 /// シェル側とパネルを描く。
 fn draw(
     terminal: &mut DefaultTerminal,
-    parser: &Mutex<vt100::Parser>,
+    parser: &Mutex<Parser>,
     selection: &SharedSelection,
     panel: &FilePanel,
     panel_visible: bool,
