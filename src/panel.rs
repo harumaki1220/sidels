@@ -115,6 +115,8 @@ struct Entry {
     is_dir: bool,
     /// コマンドライン中の glob にマッチしている。
     highlighted: bool,
+    /// Git で消したファイル（もう実在しない）。一覧の最後に、取り消し線で出す。
+    deleted: bool,
 }
 
 impl FilePanel {
@@ -277,7 +279,8 @@ impl FilePanel {
                 let item = |entry: &&Entry| {
                     entry.to_list_item(marks, self.recent.contains(&entry.name), name_width)
                 };
-                let entries: Vec<&Entry> = self.visible_entries().collect();
+                let deleted = self.deleted_entries();
+                let entries = self.visible_entries(&deleted);
                 if entries.len() <= rows {
                     entries.iter().map(item).collect()
                 } else {
@@ -313,17 +316,15 @@ impl FilePanel {
         }
     }
 
-    /// 絞り込み後の一覧。
+    /// 絞り込み後の一覧。実在するファイルのあとに、消したファイル（`deleted`）を並べる。
     ///
     /// 何も残らないときは全部出す（コマンド名を打っている間に一覧が空にならないように）。
-    fn visible_entries(&self) -> impl Iterator<Item = &Entry> {
-        let any_match = self
-            .entries
-            .iter()
-            .any(|e| e.name.starts_with(&self.filter));
-        self.entries
-            .iter()
-            .filter(move |e| !any_match || e.name.starts_with(&self.filter))
+    fn visible_entries<'a>(&'a self, deleted: &'a [Entry]) -> Vec<&'a Entry> {
+        let all = || self.entries.iter().chain(deleted);
+        let any_match = all().any(|e| e.name.starts_with(&self.filter));
+        all()
+            .filter(|e| !any_match || e.name.starts_with(&self.filter))
+            .collect()
     }
 
     /// 読み込み係からの結果を反映する。
@@ -354,6 +355,31 @@ impl FilePanel {
         self.entries = entries;
         self.error = error;
         (true, changed)
+    }
+
+    /// Git で消したファイル（`D` の印が付いていて、もう実在しないもの）を、名前順に並べたもの。
+    ///
+    /// 消したファイルはディレクトリに残っていないので、`read_dir` の一覧には出てこない。
+    /// Git の印から拾って、消したことに気づけるようにする。
+    fn deleted_entries(&self) -> Vec<Entry> {
+        let Some(git) = &self.git else {
+            return Vec::new();
+        };
+        let mut deleted: Vec<Entry> = git
+            .marks
+            .iter()
+            .filter(|(name, mark)| {
+                mark.letter == 'D' && !self.entries.iter().any(|entry| &entry.name == *name)
+            })
+            .map(|(name, _)| Entry {
+                name: name.clone(),
+                is_dir: false,
+                highlighted: false,
+                deleted: true,
+            })
+            .collect();
+        deleted.sort_by(|a, b| a.name.cmp(&b.name));
+        deleted
     }
 
     /// 最近（[`RECENT_WINDOW`] 以内に）書き換えられたファイルの名前。
@@ -441,6 +467,14 @@ impl Entry {
         };
         let style = if self.highlighted {
             style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
+        };
+        // 消したファイルは、赤い取り消し線で「もうない」ことを示す
+        let style = if self.deleted {
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::CROSSED_OUT)
         } else {
             style
         };
@@ -644,6 +678,7 @@ fn read_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
                 Err(_) => false,
             },
             highlighted: false,
+            deleted: false,
         })
         .collect();
 
