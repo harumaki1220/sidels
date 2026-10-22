@@ -1,7 +1,7 @@
 //! シェル側。
 //!
 //! PTY の出力を仮想端末（vt100）に流し込み、その画面から入力中の内容を読む。
-//! 中のアプリが出したクリップボードへの書き込み（OSC 52）は、外側のターミナルに伝える。
+//! 中のアプリが出したクリップボードへの書き込み（OSC 52）、タイトル、今いる場所（OSC 7）は、外側のターミナルに伝える。
 
 use std::io::Read;
 use std::sync::mpsc::Sender;
@@ -43,6 +43,26 @@ impl vt100::Callbacks for Relay {
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
         self.pass_through([b"\x1b]52;", ty, b";", data, b"\x07"].concat());
     }
+
+    // OSC 0（アイコン名とタイトル）でも呼ばれる。アイコン名は今のターミナルでは使われないので、タイトルだけ伝える
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.pass_through([b"\x1b]2;", title, b"\x07"].concat());
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if is_relayed_osc(params) {
+            self.pass_through([b"\x1b]", params.join(&b';').as_slice(), b"\x07"].concat());
+        }
+    }
+}
+
+/// vt100 が扱わない OSC のうち、外側のターミナルに伝えるものか。
+///
+/// - OSC 7、OSC 9;9: シェルの今いる場所。ターミナルが「同じフォルダで新しいタブを開く」に使う
+///   （OSC 9;9 は Windows Terminal の形）
+/// - OSC 0 / 2: タイトルに `;` が入っていると vt100 が区切ってしまい、ここに来る
+fn is_relayed_osc(params: &[&[u8]]) -> bool {
+    matches!(params, [b"0" | b"2" | b"7", ..] | [b"9", b"9", ..])
 }
 
 /// PTY と仮想端末の大きさを変える。
@@ -147,6 +167,26 @@ mod tests {
     fn relays_clipboard_write_split_across_reads() {
         let sequences = passed_through(&[b"abc\x1b]5", b"2;c;aGVs", b"bG8=\x1b\\def"]);
         assert_eq!(sequences, vec![b"\x1b]52;c;aGVsbG8=\x07".to_vec()]);
+    }
+
+    #[test]
+    fn relays_title_and_cwd() {
+        let sequences = passed_through(&[
+            b"\x1b]0;vim main.rs\x07",
+            b"\x1b]2;a;b\x1b\\",
+            b"\x1b]7;file://host/home\x07",
+            b"\x1b]9;9;/home\x07",
+            b"\x1b]1;icon\x07\x1b]9;notify\x07",
+        ]);
+        assert_eq!(
+            sequences,
+            [
+                b"\x1b]2;vim main.rs\x07".as_slice(),
+                b"\x1b]2;a;b\x07",
+                b"\x1b]7;file://host/home\x07",
+                b"\x1b]9;9;/home\x07",
+            ]
+        );
     }
 
     #[test]

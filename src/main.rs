@@ -33,6 +33,14 @@ use shell::{Parser, Relay, SCROLLBACK_LINES, read_input, resize, spawn_output_th
 /// 大きさが変わらないままこの時間がたったら（ドラッグが止まったら）、まとめて 1 回だけ変える。
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 
+/// 外側のターミナルのタイトルを保存する（XTWINOPS 22）。
+///
+/// 中のアプリが変えたタイトルを、終わるときに元に戻すため。対応していないターミナルでは無視される。
+const SAVE_TITLE: &[u8] = b"\x1b[22;0t";
+
+/// [`SAVE_TITLE`] で保存したタイトルに戻す（XTWINOPS 23）。
+const RESTORE_TITLE: &[u8] = b"\x1b[23;0t";
+
 /// 別スレッドからメインループに届く知らせ。
 enum AppEvent {
     /// シェルが何か出力した、またはスクロールした（描き直しが必要）。
@@ -49,7 +57,7 @@ enum AppEvent {
     Copy(String),
     /// 中のアプリが出した制御文字列を、外側のターミナルにそのまま送ってほしい。
     ///
-    /// 今はクリップボードへの書き込み（OSC 52）だけ。出力係から頼む。
+    /// クリップボードへの書き込み（OSC 52）、タイトル、今いる場所（OSC 7）。出力係から頼む。
     PassThrough(Vec<u8>),
 }
 
@@ -60,16 +68,19 @@ fn main() -> Result<()> {
     execute!(io::stdout(), EnableBracketedPaste)?;
     // マウス操作も送ってもらう（ホイールでのスクロールなど）
     write_raw(mouse::ENABLE)?;
+    write_raw(SAVE_TITLE)?;
     let ratatui_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = write_raw(mouse::DISABLE);
+        let _ = write_raw(RESTORE_TITLE);
         ratatui_hook(info);
     }));
     // run の中で ? によるエラーが起きても、必ず restore まで来る
     let result = run(&mut terminal);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = write_raw(mouse::DISABLE);
+    let _ = write_raw(RESTORE_TITLE);
     ratatui::restore();
     result
 }
