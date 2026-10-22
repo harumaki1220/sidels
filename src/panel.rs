@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::git::{self, Branch, GitKind, GitMark, GitStatus};
+use crate::git::{self, GitKind, GitMark, GitStatus};
 
 /// 同じディレクトリを読み直す間隔。
 ///
@@ -256,13 +256,9 @@ impl FilePanel {
 
     /// パネルを `area` に描く。
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let mut title = vec![Span::raw(format!(" {} ", self.title()))];
-        if let Some(git) = &self.git {
-            title.extend(branch_spans(&git.branch));
-        }
-        let block = Block::default()
-            .borders(Borders::LEFT)
-            .title(Line::from(title));
+        // 左の区切り線の 1 列を除いた幅に、見出しを収める
+        let title = self.title_line(usize::from(area.width).saturating_sub(1));
+        let block = Block::default().borders(Borders::LEFT).title(title);
 
         let items: Vec<ListItem> = match &self.error {
             Some(message) => vec![ListItem::new(Line::styled(
@@ -408,25 +404,73 @@ impl FilePanel {
         }
     }
 
-    /// パネルの見出し。
+    /// パネルの見出しの部品 `(前に付ける印, ディレクトリ名, 後ろに付ける印)`。
     ///
-    /// ディレクトリ名だけにし、シェルの現在地以外を先に見せているときは → を付ける。
-    /// 読み込みが終わるまでは前の場所の一覧のままなので、… を付けて読み込み中だと分かるようにする。
-    fn title(&self) -> String {
+    /// ディレクトリ名だけにし、シェルの現在地以外を先に見せているときは前に → を付ける。
+    /// 読み込みが終わるまでは前の場所の一覧のままなので、後ろに … を付けて読み込み中だと分かるようにする。
+    fn title_parts(&self) -> (&'static str, String, &'static str) {
         let name = match self.wanted.file_name() {
             Some(name) => format!("{}/", name.to_string_lossy()),
             None => self.wanted.display().to_string(), // ルート "/" のとき
         };
-        let name = if self.wanted == self.cwd {
-            name
-        } else {
-            format!("→ {name}")
+        let prefix = if self.wanted == self.cwd { "" } else { "→ " };
+        let suffix = if self.wanted == self.dir { "" } else { " …" };
+        (prefix, name, suffix)
+    }
+
+    /// パネルの見出し（変わったかどうかの判定に使う）。
+    fn title(&self) -> String {
+        let (prefix, name, suffix) = self.title_parts();
+        format!("{prefix}{name}{suffix}")
+    }
+
+    /// 見出しを `width` 列に収めて作る。Git の管理下なら後ろにブランチ（`main ↑2↓1`）を付ける。
+    ///
+    /// ディレクトリ名が長いとブランチがはみ出して見えなくなるので、収まらないときは
+    /// ディレクトリ名とブランチ名で幅を分け合い、それぞれ真ん中を省略する。
+    fn title_line(&self, width: usize) -> Line<'static> {
+        let (prefix, name, suffix) = self.title_parts();
+        // 前後の空白と、前後の印の分
+        let fixed = 2 + prefix.width() + suffix.width();
+        let Some(git) = &self.git else {
+            let name = fit_name(&name, false, width.saturating_sub(fixed));
+            return Line::from(format!(" {prefix}{name}{suffix} "));
         };
-        if self.wanted == self.dir {
-            name
-        } else {
-            format!("{name} …")
+
+        let branch = &git.branch;
+        let branch_name = branch
+            .name
+            .clone()
+            .unwrap_or_else(|| "(detached)".to_string());
+        let ahead = (branch.ahead > 0).then(|| format!(" ↑{}", branch.ahead));
+        let behind = (branch.behind > 0).then(|| {
+            let gap = if branch.ahead > 0 { "" } else { " " };
+            format!("{gap}↓{}", branch.behind)
+        });
+        let counts_width =
+            ahead.as_deref().map_or(0, str::width) + behind.as_deref().map_or(0, str::width);
+        // ディレクトリ名とブランチ名の間の空白 1 列も除いた、2 つの名前に使える幅
+        let room = width.saturating_sub(fixed + 1 + counts_width);
+        let (name_width, branch_width) = share_width(name.width(), branch_name.width(), room);
+
+        let mut spans = vec![
+            Span::raw(format!(
+                " {prefix}{}{suffix} ",
+                fit_name(&name, false, name_width)
+            )),
+            Span::styled(
+                fit_name(&branch_name, false, branch_width),
+                Style::default().fg(Color::Magenta),
+            ),
+        ];
+        if let Some(ahead) = ahead {
+            spans.push(Span::styled(ahead, Style::default().fg(Color::Green)));
         }
+        if let Some(behind) = behind {
+            spans.push(Span::styled(behind, Style::default().fg(Color::Red)));
+        }
+        spans.push(Span::raw(" "));
+        Line::from(spans)
     }
 }
 
@@ -565,30 +609,22 @@ fn overflow_item(hidden: &[&Entry]) -> ListItem<'static> {
     ListItem::new(Line::from(spans))
 }
 
-/// 見出しの後ろに付けるブランチの表示（`main ↑2↓1`）。
+/// 幅 `a` と `b` の 2 つを、合わせて `room` 列に収めるように分ける。
 ///
-/// リモートとの差がなければ矢印は出さない。ブランチに入っていなければ `(detached)`。
-fn branch_spans(branch: &Branch) -> Vec<Span<'static>> {
-    let name = branch
-        .name
-        .clone()
-        .unwrap_or_else(|| "(detached)".to_string());
-    let mut spans = vec![Span::styled(name, Style::default().fg(Color::Magenta))];
-    if branch.ahead > 0 {
-        spans.push(Span::styled(
-            format!(" ↑{}", branch.ahead),
-            Style::default().fg(Color::Green),
-        ));
+/// 収まるならそのまま。収まらなければ、短い方は削らずに残りを長い方に回し、
+/// どちらも半分より長ければ半分ずつにする。
+fn share_width(a: usize, b: usize, room: usize) -> (usize, usize) {
+    if a + b <= room {
+        return (a, b);
     }
-    if branch.behind > 0 {
-        let gap = if branch.ahead > 0 { "" } else { " " };
-        spans.push(Span::styled(
-            format!("{gap}↓{}", branch.behind),
-            Style::default().fg(Color::Red),
-        ));
+    let half = room / 2;
+    if a <= half {
+        (a, room - a)
+    } else if b <= half {
+        (room - b, b)
+    } else {
+        (room - half, half)
     }
-    spans.push(Span::raw(" "));
-    spans
 }
 
 /// Git の印の色。`git status` の色分けに合わせ、`git add` 済みは緑、まだの変更は黄色にする。
