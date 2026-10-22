@@ -8,14 +8,14 @@ Git の管理下では、変更のあるファイルに `M` や `?` の印が付
 
 中で動くのはいつものシェル（`$SHELL`）なので、設定やキー操作はそのまま使えます。
 
-> Linux（WSL 含む）専用です。
+> Linux（WSL 含む）専用です。x86_64 と ARM（aarch64）に対応しています。
 
 ## インストール
 
-ビルド済みのファイルをダウンロードして、`~/.local/bin` などパスの通った場所に置きます。
+ビルド済みのファイルをダウンロードして、`~/.local/bin` などパスの通った場所に置きます（`uname -m` で PC の種類に合ったファイルを選びます）。
 
 ```sh
-curl -L https://github.com/harumaki1220/sidels/releases/latest/download/sidels-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/harumaki1220/sidels/releases/latest/download/sidels-$(uname -m)-linux.tar.gz | tar xz
 mv sidels ~/.local/bin/
 ```
 

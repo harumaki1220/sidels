@@ -17,11 +17,22 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
-  TARGET: x86_64-unknown-linux-musl
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  # CPU の種類ごとに、そのマシンで直接ビルドする（ARM 向けも ARM のマシンで作るので、特別な設定が要らない）
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      # musl で静的リンクすると、Linux のディストリビューションやバージョン（glibc）を問わず動く
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+      ASSET: sidels-${{ matrix.arch }}-linux.tar.gz
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,7 +47,6 @@ jobs:
             exit 1
           fi
 
-      # musl で静的リンクすると、Ubuntu のバージョン（glibc）を問わず動く
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.TARGET }}
@@ -45,16 +55,30 @@ jobs:
       - name: Package
         run: |
           strip "target/$TARGET/release/sidels"
-          tar czf sidels-x86_64-linux.tar.gz -C "target/$TARGET/release" sidels
-          sha256sum sidels-x86_64-linux.tar.gz > sidels-x86_64-linux.tar.gz.sha256
+          tar czf "$ASSET" -C "target/$TARGET/release" sidels
+          sha256sum "$ASSET" > "$ASSET.sha256"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: sidels-*
+
+  # 全部のビルドが終わってから、Release を 1 回だけ作る（並べて作ると、同時に作ろうとしてぶつかる）
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          files="sidels-x86_64-linux.tar.gz sidels-x86_64-linux.tar.gz.sha256"
+          ls -l sidels-*
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" $files --clobber
+            gh release upload "$TAG" sidels-* --clobber
           else
-            gh release create "$TAG" $files --title "$TAG" --generate-notes
+            gh release create "$TAG" sidels-* --title "$TAG" --generate-notes
           fi

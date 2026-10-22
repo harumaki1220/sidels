@@ -73,7 +73,7 @@ anyhow / crossterm 0.29 / globset 0.4 / portable-pty 0.9 / ratatui 0.30 / tui-te
 
 - 動作確認は手動（`cargo run` して実際に触る）。変更後は最低限 `cargo build` と `cargo clippy` が通ること
 - push すると CI（`.github/workflows/ci.yml`）が `cargo fmt --check`、`cargo clippy -- -D warnings`（警告もエラー扱い）、build、test と、Rust 1.88 でのビルドを確かめる。コミット前に `cargo fmt` をかけておく
-- リリース: `Cargo.toml` の `version` を上げてコミットし、`vX.Y.Z` のタグを push する。`.github/workflows/release.yml` が musl で静的リンクしたファイルをビルドして GitHub の Release に置く（タグと `version` がずれていると止まる）
+- リリース: `Cargo.toml` の `version` を上げてコミットし、`vX.Y.Z` のタグを push する。`.github/workflows/release.yml` が x86_64 と aarch64（ARM のマシンで直接）向けに musl で静的リンクしたファイルをビルドして GitHub の Release に置く（タグと `version` がずれていると止まる）
 - コミットメッセージは英語の Conventional Commits（`feat:` `fix:` `refactor:` など、続きは小文字始まり）
 - 変更するときは、何をなぜ変えたかを短く説明すること
 - コメントは「なぜ」を書く。名前を読めば分かることは書かない
