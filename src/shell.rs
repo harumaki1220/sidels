@@ -11,7 +11,7 @@ use std::thread;
 use anyhow::Result;
 use portable_pty::{MasterPty, PtySize};
 
-use crate::AppEvent;
+use crate::{AppEvent, selection};
 
 /// 左ペインの履歴として覚えておく行数。
 pub const SCROLLBACK_LINES: usize = 10_000;
@@ -41,6 +41,15 @@ impl vt100::Callbacks for Relay {
     // 伝えないと、Claude Code や vim が選択した文字をコピーしてもクリップボードに入らない。
     // 中身を読ませる問い合わせ（paste_from_clipboard）は、中のアプリにクリップボードを覗かれるので伝えない
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        // 外側が OSC 52 を受け付けないときは、中身を取り出して sidels のコピーと同じ道を通す
+        if selection::uses_pbcopy() {
+            if let Some(text) = selection::decode_base64(data) {
+                let _ = self
+                    .tx
+                    .send(AppEvent::Copy(String::from_utf8_lossy(&text).into_owned()));
+            }
+            return;
+        }
         self.pass_through([b"\x1b]52;", ty, b";", data, b"\x07"].concat());
     }
 

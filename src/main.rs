@@ -51,9 +51,10 @@ enum AppEvent {
     TogglePanel,
     /// パネルの読み込み係がディレクトリを読み終えた。
     PanelLoaded,
-    /// 選んだ文字をクリップボードに入れてほしい。
+    /// 文字をクリップボードに入れてほしい。
     ///
-    /// 画面への書き込みはメインループだけが行うので、入力係から頼む。
+    /// 画面への書き込みはメインループだけが行うので、入力係（選んだ文字）から頼む。
+    /// 外側が OSC 52 を受け付けないときは、出力係（中のアプリがコピーした文字）からも頼む。
     Copy(String),
     /// 中のアプリが出した制御文字列を、外側のターミナルにそのまま送ってほしい。
     ///
@@ -296,6 +297,9 @@ fn wait_for_event(rx: &Receiver<AppEvent>, visibility: &mut PanelVisibility) -> 
             }
             // 読み込みが終わっただけでは描き直さない。中身が変わったかは panel.update が判断する
             AppEvent::PanelLoaded => {}
+            AppEvent::Copy(text) if selection::uses_pbcopy() => {
+                selection::pbcopy(text.into_bytes())
+            }
             AppEvent::Copy(text) => write_raw(&selection::osc52(&text))?,
             AppEvent::PassThrough(bytes) => write_raw(&bytes)?,
             AppEvent::Exited => return Ok(Wake::Exited),

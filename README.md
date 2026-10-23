@@ -40,7 +40,7 @@ cargo install --locked --git https://github.com/harumaki1220/sidels
 ## 気をつけること
 
 - マウス操作を受け取るので、Windows Terminal の右クリック貼り付けは効きません（Ctrl+V は使えます）
-- 選択したもののコピーには、ターミナルの OSC 52 への対応が必要です（macOS 標準の Terminal.app は非対応です。iTerm2 や Ghostty では使えます）
+- 選択したもののコピーには、ターミナルの OSC 52 への対応が必要です（iTerm2 や Ghostty では使えます）。macOS 標準の Terminal.app は非対応なので、代わりに `pbcopy` でコピーします
 - 入力中の内容は画面から読み取っているので、zsh-autosuggestions の灰色の候補にも反応することがあります
 
 ## ライセンス
