@@ -386,3 +386,48 @@ fn scroll(parser: &Mutex<Parser>, step: ScrollStep) {
     };
     screen.set_scrollback(offset);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn special_keys_are_taken_out() {
+        let (rest, keys) = take_special_keys(b"a\x1b[24~b", true);
+        assert_eq!(rest, b"ab");
+        assert!(matches!(keys[..], [SpecialKey::TogglePanel]));
+    }
+
+    #[test]
+    fn mouse_events_are_always_taken_out() {
+        let (rest, keys) = take_special_keys(b"x\x1b[<0;1;1My", false);
+        assert_eq!(rest, b"xy");
+        assert!(matches!(keys[..], [SpecialKey::Mouse(_)]));
+    }
+
+    #[test]
+    fn scroll_keys_go_to_the_app_when_it_cannot_scroll() {
+        let (rest, keys) = take_special_keys(b"\x1b[5;2~", false);
+        assert_eq!(rest, b"\x1b[5;2~");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn remove_all_drops_every_paste_mark() {
+        let input = b"\x1b[200~hi\x1b[201~\x1b[200~";
+        assert_eq!(
+            remove_all(&remove_all(input, PASTE_START), PASTE_END),
+            b"hi"
+        );
+    }
+
+    #[test]
+    fn clicks_count_up_at_the_same_place() {
+        let mut clicks = Clicks::default();
+        assert_eq!(clicks.press((0, 0)), 1);
+        assert_eq!(clicks.press((0, 0)), 2);
+        assert_eq!(clicks.press((0, 0)), 3);
+        assert_eq!(clicks.press((0, 0)), 1);
+        assert_eq!(clicks.press((0, 1)), 1);
+    }
+}

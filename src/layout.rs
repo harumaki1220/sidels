@@ -77,3 +77,38 @@ pub fn pty_size_for(area: Rect) -> PtySize {
         pixel_height: 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_shows_only_when_wide_enough() {
+        assert!(PanelVisibility::new(MIN_WIDTH_FOR_PANEL).is_visible());
+        assert!(!PanelVisibility::new(MIN_WIDTH_FOR_PANEL - 1).is_visible());
+    }
+
+    #[test]
+    fn toggle_is_kept_until_width_crosses_threshold() {
+        let mut visibility = PanelVisibility::new(120);
+        visibility.toggle();
+        assert!(!visibility.is_visible());
+        // 広いままなら、F12 で隠したことを覚えている
+        visibility.set_width(130);
+        assert!(!visibility.is_visible());
+        // 狭くなってからまた広がったら、自動判定に戻る
+        visibility.set_width(100);
+        visibility.set_width(120);
+        assert!(visibility.is_visible());
+    }
+
+    #[test]
+    fn split_keeps_panel_width_and_at_least_half_for_shell() {
+        let (shell, panel) = split(Rect::new(0, 0, 120, 40), true);
+        assert_eq!((shell.width, panel.width), (120 - PANEL_WIDTH, PANEL_WIDTH));
+        let (shell, panel) = split(Rect::new(0, 0, 40, 40), true);
+        assert_eq!((shell.width, panel.width), (20, 20));
+        let (shell, _) = split(Rect::new(0, 0, 120, 40), false);
+        assert_eq!(shell.width, 120);
+    }
+}

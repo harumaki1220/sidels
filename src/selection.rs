@@ -280,4 +280,37 @@ mod tests {
         assert_eq!(word_bounds(&[true, true, false], 0), Some((0, 1)));
         assert_eq!(word_bounds(&[false, true, true], 2), Some((1, 2)));
     }
+
+    #[test]
+    fn base64_pads_to_four_chars() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64("日本".as_bytes()), "5pel5pys");
+    }
+
+    #[test]
+    fn osc52_wraps_base64() {
+        assert_eq!(osc52("hi"), b"\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn contains_spans_rows_in_either_drag_direction() {
+        for selection in [
+            Selection {
+                anchor: (0, 5),
+                head: (1, 2),
+            },
+            Selection {
+                anchor: (1, 2),
+                head: (0, 5),
+            },
+        ] {
+            assert!(selection.contains(0, 30));
+            assert!(selection.contains(1, 0));
+            assert!(!selection.contains(0, 4));
+            assert!(!selection.contains(1, 3));
+        }
+    }
 }

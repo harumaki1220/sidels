@@ -837,3 +837,75 @@ fn glob_matches(glob: &GlobMatcher, name: &str) -> bool {
     }
     glob.is_match(name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_name_keeps_short_names() {
+        assert_eq!(fit_name("main.rs", false, 10), "main.rs");
+        assert_eq!(fit_name("src", true, 10), "src/");
+    }
+
+    #[test]
+    fn fit_name_keeps_head_and_extension() {
+        let fitted = fit_name("very-long-name-report.md", false, 16);
+        assert_eq!(fitted, "very-long-…rt.md");
+        assert_eq!(fitted.width(), 16);
+    }
+
+    #[test]
+    fn fit_name_keeps_slash_of_directories() {
+        assert_eq!(fit_name("node_modules_backup", true, 10), "node_m…up/");
+    }
+
+    #[test]
+    fn fit_name_counts_wide_chars_as_two_columns() {
+        let fitted = fit_name("日本語のファイル.txt", false, 10);
+        assert_eq!(fitted, "日本….txt");
+        assert!(fitted.width() <= 10);
+    }
+
+    #[test]
+    fn fit_name_in_tiny_space() {
+        assert_eq!(fit_name("abcdef", false, 1), "…");
+    }
+
+    #[test]
+    fn share_width_gives_the_rest_to_the_longer_one() {
+        assert_eq!(share_width(5, 5, 20), (5, 5));
+        assert_eq!(share_width(3, 30, 20), (3, 17));
+        assert_eq!(share_width(30, 3, 20), (17, 3));
+        assert_eq!(share_width(30, 30, 21), (11, 10));
+    }
+
+    fn globs_in(line: &str) -> Vec<GlobMatcher> {
+        let cwd = Path::new("/nonexistent");
+        parse_globs(line, cwd, cwd)
+    }
+
+    #[test]
+    fn globs_match_like_the_shell() {
+        let globs = globs_in("rm *.log");
+        assert_eq!(globs.len(), 1);
+        assert!(glob_matches(&globs[0], "a.log"));
+        assert!(!glob_matches(&globs[0], "a.txt"));
+        // zsh と同じく、`*` は隠しファイルにマッチしない
+        assert!(!glob_matches(&globs[0], ".old.log"));
+        assert!(glob_matches(&globs_in("ls .*")[0], ".env"));
+    }
+
+    #[test]
+    fn quoted_or_escaped_words_are_not_globs() {
+        assert!(globs_in("echo '*.log' \"*.rs\" \\*.txt").is_empty());
+        assert!(globs_in("ls src").is_empty());
+    }
+
+    #[test]
+    fn globs_with_a_directory_apply_only_to_that_directory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(parse_globs("ls src/*.rs", root, &root.join("src")).len(), 1);
+        assert!(parse_globs("ls src/*.rs", root, root).is_empty());
+    }
+}

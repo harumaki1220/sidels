@@ -169,3 +169,84 @@ fn classify(x: char, y: char) -> GitMark {
     };
     GitMark { kind, letter }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn branch(header: &str) -> (Option<String>, u32, u32) {
+        let branch = parse_branch(header);
+        (branch.name, branch.ahead, branch.behind)
+    }
+
+    /// 印を `(名前, 文字)` にして名前順に並べる。
+    fn letters(marks: &HashMap<String, GitMark>) -> Vec<(&str, char)> {
+        let mut letters: Vec<_> = marks
+            .iter()
+            .map(|(name, mark)| (name.as_str(), mark.letter))
+            .collect();
+        letters.sort();
+        letters
+    }
+
+    #[test]
+    fn branch_with_upstream_and_counts() {
+        assert_eq!(
+            branch("main...origin/main [ahead 2, behind 1]"),
+            (Some("main".into()), 2, 1)
+        );
+        assert_eq!(
+            branch("feat/x...origin/feat/x [behind 3]"),
+            (Some("feat/x".into()), 0, 3)
+        );
+    }
+
+    #[test]
+    fn branch_without_upstream_or_commits() {
+        assert_eq!(branch("main"), (Some("main".into()), 0, 0));
+        assert_eq!(
+            branch("No commits yet on main"),
+            (Some("main".into()), 0, 0)
+        );
+    }
+
+    #[test]
+    fn detached_head_has_no_branch_name() {
+        assert_eq!(branch("HEAD (no branch)"), (None, 0, 0));
+    }
+
+    #[test]
+    fn classify_follows_git_status_short() {
+        let mark = |x, y| {
+            let mark = classify(x, y);
+            (mark.kind, mark.letter)
+        };
+        assert!(mark('M', ' ') == (GitKind::Staged, 'M'));
+        assert!(mark(' ', 'M') == (GitKind::Modified, 'M'));
+        // add した後にまた変えたものは、まだ add していない方を見せる
+        assert!(mark('M', 'M') == (GitKind::Modified, 'M'));
+        assert!(mark(' ', 'D') == (GitKind::Modified, 'D'));
+        assert!(mark('?', '?') == (GitKind::Untracked, '?'));
+        assert!(mark('U', 'U') == (GitKind::Conflict, 'U'));
+        assert!(mark('A', 'A') == (GitKind::Conflict, 'U'));
+    }
+
+    #[test]
+    fn parse_groups_by_name_under_prefix() {
+        let output = " M src/main.rs\0?? notes.txt\0R  new.rs\0old.rs\0";
+        let marks = parse(output, "");
+        assert_eq!(
+            letters(&marks),
+            [("new.rs", 'R'), ("notes.txt", '?'), ("src", 'M')]
+        );
+        // src/ を見ているときは、src の中の名前に印が付き、外のものは出ない
+        let marks = parse(output, "src/");
+        assert_eq!(letters(&marks), [("main.rs", 'M')]);
+    }
+
+    #[test]
+    fn directory_gets_the_strongest_mark_inside() {
+        let marks = parse("A  src/a.rs\0 M src/b.rs\0?? src/c.rs\0", "");
+        assert!(marks["src"].kind == GitKind::Modified);
+    }
+}

@@ -133,3 +133,88 @@ pub fn incomplete_tail_start(input: &[u8]) -> usize {
         input.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(input: &[u8]) -> Option<(u16, u16, u16, bool, usize)> {
+        parse_sgr(input).map(|(e, len)| (e.code, e.col, e.row, e.pressed, len))
+    }
+
+    fn event(code: u16, pressed: bool) -> MouseEvent {
+        MouseEvent {
+            code,
+            col: 10,
+            row: 5,
+            pressed,
+        }
+    }
+
+    #[test]
+    fn parse_sgr_press_and_release() {
+        assert_eq!(parsed(b"\x1b[<0;10;5Mrest"), Some((0, 10, 5, true, 10)));
+        assert_eq!(parsed(b"\x1b[<64;1;2m"), Some((64, 1, 2, false, 10)));
+    }
+
+    #[test]
+    fn parse_sgr_rejects_incomplete_or_malformed() {
+        assert_eq!(parsed(b"\x1b[<0;10"), None);
+        assert_eq!(parsed(b"\x1b[<0;10;5;1M"), None);
+        assert_eq!(parsed(b"abc"), None);
+    }
+
+    #[test]
+    fn incomplete_tail_is_only_a_cut_mouse_event() {
+        assert_eq!(incomplete_tail_start(b"ab\x1b[<0;1"), 2);
+        assert_eq!(incomplete_tail_start(b"\x1b[<0;1;1M"), 9);
+        assert_eq!(incomplete_tail_start(b"ab"), 2);
+        // Esc キーや Alt+[ かもしれないので取っておかない
+        assert_eq!(incomplete_tail_start(b"ab\x1b"), 3);
+        assert_eq!(incomplete_tail_start(b"ab\x1b["), 4);
+    }
+
+    #[test]
+    fn encode_sgr_for_app() {
+        let sgr = MouseProtocolEncoding::Sgr;
+        let mode = MouseProtocolMode::PressRelease;
+        assert_eq!(
+            encode_for_app(event(0, true), mode, sgr).as_deref(),
+            Some(b"\x1b[<0;10;5M".as_slice())
+        );
+        assert_eq!(
+            encode_for_app(event(0, false), mode, sgr).as_deref(),
+            Some(b"\x1b[<0;10;5m".as_slice())
+        );
+    }
+
+    #[test]
+    fn encode_default_marks_release_as_button_3() {
+        let bytes = encode_for_app(
+            event(0, false),
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Default,
+        );
+        assert_eq!(bytes.as_deref(), Some(b"\x1b[M#*%".as_slice()));
+    }
+
+    #[test]
+    fn encode_skips_what_the_app_did_not_ask_for() {
+        let sgr = MouseProtocolEncoding::Sgr;
+        assert!(encode_for_app(event(0, false), MouseProtocolMode::Press, sgr).is_none());
+        // ドラッグ（32 が立っている）は ButtonMotion から
+        assert!(encode_for_app(event(32, true), MouseProtocolMode::PressRelease, sgr).is_none());
+        assert!(encode_for_app(event(32, true), MouseProtocolMode::ButtonMotion, sgr).is_some());
+    }
+
+    #[test]
+    fn encode_default_cannot_send_far_columns() {
+        let far = MouseEvent {
+            col: 300,
+            ..event(0, true)
+        };
+        let mode = MouseProtocolMode::Press;
+        assert!(encode_for_app(far, mode, MouseProtocolEncoding::Default).is_none());
+        assert!(encode_for_app(far, mode, MouseProtocolEncoding::Utf8).is_some());
+    }
+}
