@@ -34,6 +34,28 @@ impl Selection {
         }
     }
 
+    /// `pos` にある単語全体を選ぶ（ダブルクリック）。`pos` が単語の上でなければ `None`。
+    pub fn word(screen: &vt100::Screen, pos: (u16, u16)) -> Option<Self> {
+        let (row, col) = pos;
+        let (_, cols) = screen.size();
+        let is_word: Vec<bool> = (0..cols)
+            .map(|c| screen.cell(row, c).is_some_and(is_word_cell))
+            .collect();
+        let (start, end) = word_bounds(&is_word, usize::from(col))?;
+        Some(Self {
+            anchor: (row, u16::try_from(start).ok()?),
+            head: (row, u16::try_from(end).ok()?),
+        })
+    }
+
+    /// `row` の行全体を選ぶ（トリプルクリック）。
+    pub fn line(row: u16, cols: u16) -> Self {
+        Self {
+            anchor: (row, 0),
+            head: (row, cols.saturating_sub(1)),
+        }
+    }
+
     /// 選択の終わりを `pos` まで広げる（縮める）。
     pub fn extend(&mut self, pos: (u16, u16)) {
         self.head = pos;
@@ -106,6 +128,40 @@ pub fn pbcopy(text: Vec<u8>) {
     });
 }
 
+/// 単語の区切りにする記号。空白も区切りになる。
+///
+/// パスや URL を丸ごと選べるよう、`/` `.` `-` `_` `:` `~` などは単語の一部とみなす。
+const WORD_SEPARATORS: &str = "\"'`()[]{}<>|;,";
+
+/// そのセルが単語の一部か。
+fn is_word_cell(cell: &vt100::Cell) -> bool {
+    // 全角文字の右半分のセルは中身が空なので、左半分と同じく単語の一部とみなす
+    if cell.is_wide_continuation() {
+        return true;
+    }
+    let contents = cell.contents();
+    !contents.is_empty()
+        && contents
+            .chars()
+            .all(|c| !c.is_whitespace() && !WORD_SEPARATORS.contains(c))
+}
+
+/// 1 行の各セルが単語の一部か（`is_word`）から、`col` を含む単語の `(始まり, 終わり)` の列を返す。
+fn word_bounds(is_word: &[bool], col: usize) -> Option<(usize, usize)> {
+    if !*is_word.get(col)? {
+        return None;
+    }
+    let start = is_word[..col]
+        .iter()
+        .rposition(|&w| !w)
+        .map_or(0, |i| i + 1);
+    let end = is_word[col..]
+        .iter()
+        .position(|&w| !w)
+        .map_or(is_word.len(), |i| col + i);
+    Some((start, end - 1))
+}
+
 /// 外側のターミナルにクリップボードへ書き込んでもらう制御文字列（OSC 52）。
 pub fn osc52(text: &str) -> Vec<u8> {
     format!("\x1b]52;c;{}\x07", base64(text.as_bytes())).into_bytes()
@@ -176,5 +232,52 @@ mod tests {
     #[test]
     fn rejects_non_base64() {
         assert_eq!(decode_base64(b"?"), None);
+    }
+
+    fn screen_with(text: &str) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(2, 40, 0);
+        parser.process(text.as_bytes());
+        parser
+    }
+
+    fn selected_word(text: &str, col: u16) -> Option<String> {
+        let parser = screen_with(text);
+        Selection::word(parser.screen(), (0, col)).map(|s| s.text(parser.screen()))
+    }
+
+    #[test]
+    fn word_keeps_paths_whole() {
+        assert_eq!(
+            selected_word("cat ~/src/main.rs > out", 8).as_deref(),
+            Some("~/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn word_stops_at_quotes_and_brackets() {
+        assert_eq!(
+            selected_word("echo \"(feat/x)\"", 9).as_deref(),
+            Some("feat/x")
+        );
+    }
+
+    #[test]
+    fn word_includes_both_halves_of_wide_chars() {
+        // 「日本語」は 1 文字 2 列。真ん中の文字の右半分を押しても全体を選ぶ
+        assert_eq!(
+            selected_word("ls 日本語.txt", 6).as_deref(),
+            Some("日本語.txt")
+        );
+    }
+
+    #[test]
+    fn word_on_space_selects_nothing() {
+        assert_eq!(selected_word("a  b", 1), None);
+    }
+
+    #[test]
+    fn word_bounds_at_line_edges() {
+        assert_eq!(word_bounds(&[true, true, false], 0), Some((0, 1)));
+        assert_eq!(word_bounds(&[false, true, true], 2), Some((1, 2)));
     }
 }

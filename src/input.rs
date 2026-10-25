@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::AppEvent;
 use crate::mouse::{self, MouseEvent};
@@ -51,6 +52,9 @@ const CTRL_C: u8 = 0x03;
 /// Shift+↑ / Shift+↓ やホイールで一度に動かす行数。
 const SCROLL_LINES: usize = 3;
 
+/// 同じ位置で続けて押したとき、ダブルクリック（トリプルクリック）とみなす間隔。
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+
 /// 貼り付けの開始の印。
 ///
 /// 外側のターミナルは、貼り付けた文字を [`PASTE_START`] と [`PASTE_END`] で囲んで送ってくる。
@@ -72,6 +76,7 @@ pub fn spawn_input_thread(
         let mut buf = [0u8; 1024];
         // 前回の読み込みの最後で途中まで届いていたマウス操作。次に届いた分とつなげて読む
         let mut carry: Vec<u8> = Vec::new();
+        let mut clicks = Clicks::default();
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -104,7 +109,13 @@ pub fn spawn_input_thread(
                                 AppEvent::Output
                             }
                             SpecialKey::Mouse(event) => {
-                                match handle_mouse(event, &parser, &selection, &mut writer) {
+                                match handle_mouse(
+                                    event,
+                                    &parser,
+                                    &selection,
+                                    &mut clicks,
+                                    &mut writer,
+                                ) {
                                     Some(event) => event,
                                     None => continue,
                                 }
@@ -187,6 +198,7 @@ fn handle_mouse(
     event: MouseEvent,
     parser: &Mutex<Parser>,
     selection: &Mutex<Option<Selection>>,
+    clicks: &mut Clicks,
     writer: &mut Box<dyn Write + Send>,
 ) -> Option<AppEvent> {
     let (rows, cols, mode, encoding, alternate, app_cursor) = {
@@ -217,7 +229,7 @@ fn handle_mouse(
             event.row.clamp(1, rows.max(1)) - 1,
             event.col.clamp(1, cols.max(1)) - 1,
         );
-        return handle_selection(event, in_shell, pos, selection);
+        return handle_selection(event, in_shell, pos, parser, selection, clicks);
     }
 
     if !event.is_wheel() || !in_shell {
@@ -247,22 +259,70 @@ fn handle_mouse(
     Some(AppEvent::Output)
 }
 
+/// 続けてクリックした回数。
+#[derive(Default)]
+struct Clicks {
+    /// 最後に押した時刻と位置。
+    last: Option<(Instant, (u16, u16))>,
+    /// 同じ位置で続けて押した回数（1: クリック、2: ダブルクリック、3: トリプルクリック）。
+    count: u8,
+}
+
+impl Clicks {
+    /// `pos` で押されたことを記録し、続けて押した回数を返す。
+    fn press(&mut self, pos: (u16, u16)) -> u8 {
+        let now = Instant::now();
+        let continued = self.last.is_some_and(|(at, last_pos)| {
+            last_pos == pos && now.duration_since(at) <= MULTI_CLICK_INTERVAL
+        });
+        // 4 回目は普通のクリックに戻る（ほかのターミナルと同じ）
+        self.count = if continued && self.count < 3 {
+            self.count + 1
+        } else {
+            1
+        };
+        self.last = Some((now, pos));
+        self.count
+    }
+}
+
 /// 左ボタンでの選択。
 ///
 /// 押すと始まり、ドラッグで広げる。離しても選択は残し、Ctrl+C でコピーする（[`copy_selection`]）。
 /// 何も選ばずに離した（クリックしただけ）なら選択を外す。
+/// ダブルクリックで単語、トリプルクリックで行を選ぶ。
 fn handle_selection(
     event: MouseEvent,
     in_shell: bool,
     pos: (u16, u16),
+    parser: &Mutex<Parser>,
     selection: &Mutex<Option<Selection>>,
+    clicks: &mut Clicks,
 ) -> Option<AppEvent> {
-    let mut current = selection.lock().unwrap();
     if event.pressed && !event.is_motion() {
         // パネルの上で押したときは、選択を外すだけ
-        *current = in_shell.then(|| Selection::new(pos));
+        let selected = if in_shell {
+            // 仮想端末のロックは、選択のロックより先に外れる（同時に握るとデッドロックする）
+            match clicks.press(pos) {
+                2 => Selection::word(parser.lock().unwrap().screen(), pos),
+                3 => {
+                    let (_, cols) = parser.lock().unwrap().screen().size();
+                    Some(Selection::line(pos.0, cols))
+                }
+                _ => Some(Selection::new(pos)),
+            }
+        } else {
+            *clicks = Clicks::default();
+            None
+        };
+        *selection.lock().unwrap() = selected;
         return Some(AppEvent::Output);
     }
+    // 単語や行を選んだあとは、ドラッグや離したときに範囲を変えない
+    if clicks.count >= 2 {
+        return None;
+    }
+    let mut current = selection.lock().unwrap();
     let selected = current.as_mut()?;
     selected.extend(pos);
     if !event.pressed && selected.is_empty() {
