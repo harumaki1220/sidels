@@ -927,6 +927,25 @@ mod tests {
     }
 
     #[test]
+    fn process_cwd_finds_where_this_process_is() {
+        // Linux は /proc、macOS は proc_pidinfo を実際に通す。
+        // macOS の /var は /private/var の別名なので、本名にそろえてから比べる
+        let found = process_cwd(Some(std::process::id())).unwrap();
+        let expected = std::env::current_dir().unwrap();
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            expected.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn process_cwd_of_missing_process_is_none() {
+        assert_eq!(process_cwd(None), None);
+        // pid の上限（Linux は 2^22、macOS は 99999）を超えているので、この番号のプロセスはない
+        assert_eq!(process_cwd(Some(u32::MAX)), None);
+    }
+
+    #[test]
     fn visible_range_fits_without_scroll() {
         assert_eq!(visible_range(5, 10, 0), 0..5);
         // 収まるならスクロールは効かない
