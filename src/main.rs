@@ -56,6 +56,8 @@ enum AppEvent {
     /// 画面への書き込みはメインループだけが行うので、入力係（選んだ文字）から頼む。
     /// 外側が OSC 52 を受け付けないときは、出力係（中のアプリがコピーした文字）からも頼む。
     Copy(String),
+    /// パネルの上でホイールが回された。パネルの一覧をこの行数だけスクロールする（負なら上へ）。
+    ScrollPanel(isize),
     /// 中のアプリが出した制御文字列を、外側のターミナルにそのまま送ってほしい。
     ///
     /// クリップボードへの書き込み（OSC 52）、タイトル、今いる場所（OSC 7）。出力係から頼む。
@@ -206,7 +208,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             draw(terminal, &parser, &selection, &panel, panel_visible)?;
         }
 
-        match wait_for_event(&rx, &mut visibility)? {
+        match wait_for_event(&rx, &mut visibility, &mut panel)? {
             Wake::Exited => break,
             Wake::Changed => needs_draw = true,
             Wake::Idle => {}
@@ -280,7 +282,11 @@ enum Wake {
 /// 次の知らせを待つ。
 ///
 /// 何も来なくても 50ms ごとに戻り、ウィンドウサイズの変化を拾えるようにしている。
-fn wait_for_event(rx: &Receiver<AppEvent>, visibility: &mut PanelVisibility) -> Result<Wake> {
+fn wait_for_event(
+    rx: &Receiver<AppEvent>,
+    visibility: &mut PanelVisibility,
+    panel: &mut FilePanel,
+) -> Result<Wake> {
     let first = match rx.recv_timeout(Duration::from_millis(50)) {
         Ok(event) => event,
         Err(RecvTimeoutError::Timeout) => return Ok(Wake::Idle),
@@ -297,6 +303,7 @@ fn wait_for_event(rx: &Receiver<AppEvent>, visibility: &mut PanelVisibility) -> 
             }
             // 読み込みが終わっただけでは描き直さない。中身が変わったかは panel.update が判断する
             AppEvent::PanelLoaded => {}
+            AppEvent::ScrollPanel(lines) => changed |= panel.scroll(lines),
             AppEvent::Copy(text) if selection::uses_pbcopy() => {
                 selection::pbcopy(text.into_bytes())
             }

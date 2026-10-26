@@ -192,7 +192,7 @@ fn take_special_keys(input: &[u8], can_scroll: bool) -> (Vec<u8>, Vec<SpecialKey
 /// - 中のアプリがマウスを頼んでいる（vim や htop など）: シェル側の操作だけ、アプリが頼んだ形式で渡す。
 ///   シェル側は画面の左上にあるので、座標はそのままでよい
 /// - 左ボタン: シェル側の文字を選択する
-/// - ホイール: 別画面（less など）なら ↑↓ キーとして渡し、普段は履歴をスクロールする
+/// - ホイール: パネルの上なら一覧をスクロールする。シェル側では、別画面（less など）なら ↑↓ キーとして渡し、普段は履歴をスクロールする
 /// - パネルの上でのそれ以外の操作: 何もしない
 fn handle_mouse(
     event: MouseEvent,
@@ -215,6 +215,16 @@ fn handle_mouse(
         )
     };
     let in_shell = event.col <= cols && event.row <= rows;
+
+    // パネルの上のホイールは、中のアプリがマウスを頼んでいても一覧のスクロールにする
+    if event.is_wheel() && !in_shell {
+        let lines = SCROLL_LINES.cast_signed();
+        return Some(AppEvent::ScrollPanel(if event.is_wheel_up() {
+            -lines
+        } else {
+            lines
+        }));
+    }
 
     if mode != vt100::MouseProtocolMode::None {
         if in_shell && let Some(bytes) = mouse::encode_for_app(event, mode, encoding) {

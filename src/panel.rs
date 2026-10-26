@@ -4,7 +4,9 @@
 //! 移動先のプレビュー・絞り込み・glob ハイライトを行う。Git の管理下なら、変更のあるファイルに印を付ける。
 //! 最近書き換えられたファイルには、名前の後ろに ● を付ける。
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -105,6 +107,10 @@ pub struct FilePanel {
     globs: Vec<GlobMatcher>,
     /// 打ちかけの名前。これで始まるものだけを表示する。
     filter: String,
+    /// 一覧の先頭から飛ばしている件数（パネルの上でホイールを回した分）。
+    scroll: usize,
+    /// 最後に描いたときの、一覧に使える行数。スクロールしすぎないように覚えておく。
+    rows: Cell<usize>,
 }
 
 /// パネルの 1 行（ファイルまたはディレクトリ）。
@@ -163,6 +169,8 @@ impl FilePanel {
             command_line: String::new(),
             globs: Vec::new(),
             filter: String::new(),
+            scroll: 0,
+            rows: Cell::new(0),
         }
     }
 
@@ -248,6 +256,11 @@ impl FilePanel {
             self.mark_matches();
         }
 
+        // 絞り込みが変わったら、一覧の先頭から見せる
+        if self.filter != filter_before {
+            self.scroll = 0;
+        }
+
         listing_changed
             || line_changed
             || self.filter != filter_before
@@ -277,19 +290,34 @@ impl FilePanel {
                 };
                 let deleted = self.deleted_entries();
                 let entries = self.visible_entries(&deleted);
-                if entries.len() <= rows {
-                    entries.iter().map(item).collect()
-                } else {
-                    // 入りきらないときは最後の 1 行を使って、隠れている件数を知らせる
-                    let shown = rows.saturating_sub(1);
-                    let mut items: Vec<ListItem> = entries[..shown].iter().map(item).collect();
-                    items.push(overflow_item(&entries[shown..]));
-                    items
+                self.rows.set(rows);
+                let range = visible_range(entries.len(), rows, self.scroll);
+                // 入りきらないときは上下の 1 行ずつを使って、隠れている件数を知らせる
+                let mut items = Vec::with_capacity(rows);
+                if range.start > 0 {
+                    items.push(overflow_item("↑", &entries[..range.start]));
                 }
+                items.extend(entries[range.clone()].iter().map(item));
+                if range.end < entries.len() {
+                    items.push(overflow_item("↓", &entries[range.end..]));
+                }
+                items
             }
         };
 
         frame.render_widget(List::new(items).block(block), area);
+    }
+
+    /// 一覧を `lines` 行スクロールする（負なら上へ）。動いたら `true`。
+    pub fn scroll(&mut self, lines: isize) -> bool {
+        let deleted = self.deleted_entries();
+        let max = max_scroll(self.visible_entries(&deleted).len(), self.rows.get());
+        // 一覧が縮んで行き過ぎていることがあるので、今の位置も収め直してから動かす
+        let current = self.scroll.min(max);
+        let scroll = current.saturating_add_signed(lines).min(max);
+        let moved = scroll != self.scroll;
+        self.scroll = scroll;
+        moved
     }
 
     /// 打ちかけの単語から、表示するディレクトリと絞り込みに使う名前を決める。
@@ -345,6 +373,7 @@ impl FilePanel {
             // 前の場所の印が、新しい場所の同じ名前のファイルに付かないように消しておく
             self.git = None;
             self.mtimes = None;
+            self.scroll = 0;
         }
         self.dir = dir;
         self.last_refresh = Instant::now();
@@ -609,13 +638,38 @@ fn take_end(s: &str, max: usize) -> &str {
     s
 }
 
-/// パネルに入りきらなかった分を知らせる 1 行（「… 他 N 件」）。
+/// `len` 件の一覧を `rows` 行に、先頭から `scroll` 件飛ばして並べるときに、表示する範囲。
 ///
+/// 上に隠れたものがあれば 1 行目、下に隠れたものがあれば最後の行を、件数の知らせに使う。
+fn visible_range(len: usize, rows: usize, scroll: usize) -> Range<usize> {
+    if len <= rows {
+        return 0..len;
+    }
+    let start = scroll.min(max_scroll(len, rows));
+    let mut room = rows.saturating_sub(usize::from(start > 0));
+    if len - start > room {
+        room = room.saturating_sub(1);
+    }
+    start..start + room
+}
+
+/// スクロールできる一番下の位置（最後のものが 1 行目の知らせの下にぴったり収まるところ）。
+fn max_scroll(len: usize, rows: usize) -> usize {
+    if len <= rows {
+        0
+    } else {
+        len - rows.saturating_sub(1).max(1)
+    }
+}
+
+/// パネルに入りきらなかった分を知らせる 1 行（「↓ 他 N 件」）。
+///
+/// `arrow` は隠れている向き。
 /// 隠れた中に glob にマッチするものがあれば、その件数も目立たせて出す。
 /// `rm *.log` で消えるファイルが見えないところにある、というのを見逃さないため。
-fn overflow_item(hidden: &[&Entry]) -> ListItem<'static> {
+fn overflow_item(arrow: &str, hidden: &[&Entry]) -> ListItem<'static> {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut spans = vec![Span::styled(format!("… 他 {} 件", hidden.len()), dim)];
+    let mut spans = vec![Span::styled(format!("{arrow} 他 {} 件", hidden.len()), dim)];
     let matched = hidden.iter().filter(|entry| entry.highlighted).count();
     if matched > 0 {
         spans.push(Span::styled(
@@ -870,6 +924,25 @@ mod tests {
     #[test]
     fn fit_name_in_tiny_space() {
         assert_eq!(fit_name("abcdef", false, 1), "…");
+    }
+
+    #[test]
+    fn visible_range_fits_without_scroll() {
+        assert_eq!(visible_range(5, 10, 0), 0..5);
+        // 収まるならスクロールは効かない
+        assert_eq!(visible_range(5, 10, 3), 0..5);
+    }
+
+    #[test]
+    fn visible_range_leaves_lines_for_hidden_counts() {
+        // 先頭: 9 件 + 下の知らせ
+        assert_eq!(visible_range(30, 10, 0), 0..9);
+        // 途中: 上の知らせ + 8 件 + 下の知らせ
+        assert_eq!(visible_range(30, 10, 5), 5..13);
+        // 一番下: 上の知らせ + 最後の 9 件。行き過ぎても止まる
+        assert_eq!(visible_range(30, 10, 21), 21..30);
+        assert_eq!(visible_range(30, 10, 100), 21..30);
+        assert_eq!(max_scroll(30, 10), 21);
     }
 
     #[test]
