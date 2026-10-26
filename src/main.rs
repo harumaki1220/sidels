@@ -246,7 +246,7 @@ fn draw(
             let buf = frame.buffer_mut();
             for row in 0..left.height {
                 for col in 0..left.width {
-                    if selected.contains(row, col) {
+                    if selected.contains(selection::history_row(screen, row), col) {
                         buf[(left.x + col, left.y + row)]
                             .modifier
                             .toggle(Modifier::REVERSED);

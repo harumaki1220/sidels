@@ -15,19 +15,31 @@ pub type SharedSelection = Arc<Mutex<Option<Selection>>>;
 
 /// 選択範囲。
 ///
-/// 位置は `(行, 列)` で、今シェル側に見えている画面の左上が `(0, 0)`。
+/// 位置は `(行, 列)`。行は履歴の中の位置で、さかのぼっていないときの画面の一番上が 0、履歴はマイナスになる
+/// （[`history_row`]）。画面の何行目かで覚えると、スクロールしたときに別の行を指してしまうため。
 /// 入力係（マウス）が書き換え、メインループ（描画）が読む。
 #[derive(Clone, Copy)]
 pub struct Selection {
     /// ドラッグを始めた位置。
-    anchor: (u16, u16),
+    anchor: (i32, u16),
     /// 今マウスがある位置。
-    head: (u16, u16),
+    head: (i32, u16),
+}
+
+/// 画面の `row` 行目が、履歴の中で何行目か（[`Selection`] の行の数え方）。
+pub fn history_row(screen: &vt100::Screen, row: u16) -> i32 {
+    i32::from(row) - scrollback(screen)
+}
+
+/// 今さかのぼっている行数。
+fn scrollback(screen: &vt100::Screen) -> i32 {
+    // 履歴は SCROLLBACK_LINES 行までなので、i32 に収まる
+    i32::try_from(screen.scrollback()).unwrap_or(i32::MAX)
 }
 
 impl Selection {
     /// `pos` から選択を始める。
-    pub fn new(pos: (u16, u16)) -> Self {
+    pub fn new(pos: (i32, u16)) -> Self {
         Self {
             anchor: pos,
             head: pos,
@@ -35,11 +47,12 @@ impl Selection {
     }
 
     /// `pos` にある単語全体を選ぶ（ダブルクリック）。`pos` が単語の上でなければ `None`。
-    pub fn word(screen: &vt100::Screen, pos: (u16, u16)) -> Option<Self> {
+    pub fn word(screen: &vt100::Screen, pos: (i32, u16)) -> Option<Self> {
         let (row, col) = pos;
         let (_, cols) = screen.size();
+        let visible_row = u16::try_from(row + scrollback(screen)).ok()?;
         let is_word: Vec<bool> = (0..cols)
-            .map(|c| screen.cell(row, c).is_some_and(is_word_cell))
+            .map(|c| screen.cell(visible_row, c).is_some_and(is_word_cell))
             .collect();
         let (start, end) = word_bounds(&is_word, usize::from(col))?;
         Some(Self {
@@ -49,7 +62,7 @@ impl Selection {
     }
 
     /// `row` の行全体を選ぶ（トリプルクリック）。
-    pub fn line(row: u16, cols: u16) -> Self {
+    pub fn line(row: i32, cols: u16) -> Self {
         Self {
             anchor: (row, 0),
             head: (row, cols.saturating_sub(1)),
@@ -57,7 +70,7 @@ impl Selection {
     }
 
     /// 選択の終わりを `pos` まで広げる（縮める）。
-    pub fn extend(&mut self, pos: (u16, u16)) {
+    pub fn extend(&mut self, pos: (i32, u16)) {
         self.head = pos;
     }
 
@@ -69,7 +82,7 @@ impl Selection {
     /// 画面の上から順に並べた `(始まり, 終わり)`。
     ///
     /// 上へドラッグしたときも、下へドラッグしたときと同じように扱うために使う。
-    fn ordered(self) -> ((u16, u16), (u16, u16)) {
+    fn ordered(self) -> ((i32, u16), (i32, u16)) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
         } else {
@@ -80,7 +93,7 @@ impl Selection {
     /// その位置が選択範囲に入っているか。
     ///
     /// 行をまたぐときは、始まりの行は右端まで、終わりの行は左端からが範囲に入る。
-    pub fn contains(self, row: u16, col: u16) -> bool {
+    pub fn contains(self, row: i32, col: u16) -> bool {
         let (start, end) = self.ordered();
         start <= (row, col) && (row, col) <= end
     }
@@ -88,10 +101,35 @@ impl Selection {
     /// 選んだ文字。
     ///
     /// 折り返された行はつなげ、行末の空白は落とす（vt100 に任せる）。
-    pub fn text(self, screen: &vt100::Screen) -> String {
+    /// vt100 は見えている画面からしか読めないので、画面の外の行は一時的にさかのぼって読み、最後に元に戻す。
+    pub fn text(self, screen: &mut vt100::Screen) -> String {
         let (start, end) = self.ordered();
-        // contents_between の終わりの列は含まないので、1 つ先まで指定する
-        screen.contents_between(start.0, start.1, end.0, end.1 + 1)
+        let (rows, cols) = screen.size();
+        let saved = screen.scrollback();
+        let mut text = String::new();
+        // 一度に読めるのは画面 1 枚分なので、上から画面の高さずつ区切って読む
+        let mut top = start.0;
+        while top <= end.0 {
+            let bottom = end.0.min(top + i32::from(rows) - 1);
+            // top が画面の一番上に来るまでさかのぼる（今の画面の中なら、さかのぼらない）
+            screen.set_scrollback(usize::try_from(-top).unwrap_or(0));
+            let shift = scrollback(screen);
+            // 古すぎて履歴から消えた行は読めないので飛ばす
+            if let (Ok(first), Ok(last)) =
+                (u16::try_from(top + shift), u16::try_from(bottom + shift))
+            {
+                let start_col = if top == start.0 { start.1 } else { 0 };
+                // contents_between の終わりの列は含まないので、1 つ先まで指定する
+                let end_col = if bottom == end.0 { end.1 + 1 } else { cols };
+                text.push_str(&screen.contents_between(first, start_col, last, end_col));
+                if bottom < end.0 && !screen.row_wrapped(last) {
+                    text.push('\n');
+                }
+            }
+            top = bottom + 1;
+        }
+        screen.set_scrollback(saved);
+        text
     }
 }
 
@@ -241,8 +279,37 @@ mod tests {
     }
 
     fn selected_word(text: &str, col: u16) -> Option<String> {
-        let parser = screen_with(text);
-        Selection::word(parser.screen(), (0, col)).map(|s| s.text(parser.screen()))
+        let mut parser = screen_with(text);
+        let selection = Selection::word(parser.screen(), (0, col))?;
+        Some(selection.text(parser.screen_mut()))
+    }
+
+    /// 3 行の画面に 1〜6 を 1 行ずつ出したもの。画面には 4〜6、履歴に 1〜3 が残る。
+    fn six_lines() -> vt100::Parser {
+        let mut parser = vt100::Parser::new(3, 10, 10);
+        parser.process(b"1\r\n2\r\n3\r\n4\r\n5\r\n6");
+        parser
+    }
+
+    #[test]
+    fn history_row_counts_back_from_the_live_screen() {
+        let mut parser = six_lines();
+        assert_eq!(history_row(parser.screen(), 0), 0);
+        parser.screen_mut().set_scrollback(2);
+        assert_eq!(history_row(parser.screen(), 0), -2);
+    }
+
+    #[test]
+    fn text_reads_lines_scrolled_out_of_view() {
+        let mut parser = six_lines();
+        parser.screen_mut().set_scrollback(1);
+        let selection = Selection {
+            anchor: (-3, 0),
+            head: (1, 0),
+        };
+        assert_eq!(selection.text(parser.screen_mut()), "1\n2\n3\n4\n5");
+        // 読み終わったら、さかのぼっていた位置に戻す
+        assert_eq!(parser.screen().scrollback(), 1);
     }
 
     #[test]

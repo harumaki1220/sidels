@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::AppEvent;
 use crate::mouse::{self, MouseEvent};
-use crate::selection::{Selection, SharedSelection};
+use crate::selection::{Selection, SharedSelection, history_row};
 use crate::shell::Parser;
 
 /// sidels が横取りするキー。
@@ -76,7 +76,7 @@ pub fn spawn_input_thread(
         let mut buf = [0u8; 1024];
         // 前回の読み込みの最後で途中まで届いていたマウス操作。次に届いた分とつなげて読む
         let mut carry: Vec<u8> = Vec::new();
-        let mut clicks = Clicks::default();
+        let mut left = LeftButton::default();
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -103,8 +103,7 @@ pub fn spawn_input_thread(
                         let event = match key {
                             SpecialKey::TogglePanel => AppEvent::TogglePanel,
                             SpecialKey::Scroll(step) => {
-                                // 見えている範囲が動くので、選択は外す
-                                clear_selection(&selection);
+                                // 選択は履歴の中の位置で覚えているので、スクロールしても外さない
                                 scroll(&parser, step);
                                 AppEvent::Output
                             }
@@ -113,7 +112,7 @@ pub fn spawn_input_thread(
                                     event,
                                     &parser,
                                     &selection,
-                                    &mut clicks,
+                                    &mut left,
                                     &mut writer,
                                 ) {
                                     Some(event) => event,
@@ -198,7 +197,7 @@ fn handle_mouse(
     event: MouseEvent,
     parser: &Mutex<Parser>,
     selection: &Mutex<Option<Selection>>,
-    clicks: &mut Clicks,
+    left: &mut LeftButton,
     writer: &mut Box<dyn Write + Send>,
 ) -> Option<AppEvent> {
     let (rows, cols, mode, encoding, alternate, app_cursor) = {
@@ -233,20 +232,20 @@ fn handle_mouse(
         return None;
     }
 
+    // マウスがある位置（履歴の中の位置）。パネルの上までドラッグしても、選ぶのはシェル側の端まで
+    let pointer = |parser: &Mutex<Parser>| {
+        let row = event.row.clamp(1, rows.max(1)) - 1;
+        let col = event.col.clamp(1, cols.max(1)) - 1;
+        (history_row(parser.lock().unwrap().screen(), row), col)
+    };
+
     if event.is_left() {
-        // パネルの上までドラッグしても、選ぶのはシェル側の端まで
-        let pos = (
-            event.row.clamp(1, rows.max(1)) - 1,
-            event.col.clamp(1, cols.max(1)) - 1,
-        );
-        return handle_selection(event, in_shell, pos, parser, selection, clicks);
+        return handle_selection(event, in_shell, pointer(parser), parser, selection, left);
     }
 
     if !event.is_wheel() || !in_shell {
         return None;
     }
-    // 見えている範囲が動くので、選択は外す
-    clear_selection(selection);
     let up = event.is_wheel_up();
     if alternate {
         let key: &[u8] = match (up, app_cursor) {
@@ -266,21 +265,31 @@ fn handle_mouse(
         ScrollStep::LinesDown
     };
     scroll(parser, step);
+    // 選択は履歴の中の位置で覚えているので、スクロールしても外さない。
+    // ドラッグしながら回したときは、スクロールした先まで選択を広げる
+    if left.dragging && left.count < 2 {
+        let pos = pointer(parser);
+        if let Some(selected) = selection.lock().unwrap().as_mut() {
+            selected.extend(pos);
+        }
+    }
     Some(AppEvent::Output)
 }
 
-/// 続けてクリックした回数。
+/// 左ボタンの状態。
 #[derive(Default)]
-struct Clicks {
+struct LeftButton {
     /// 最後に押した時刻と位置。
-    last: Option<(Instant, (u16, u16))>,
+    last: Option<(Instant, (i32, u16))>,
     /// 同じ位置で続けて押した回数（1: クリック、2: ダブルクリック、3: トリプルクリック）。
     count: u8,
+    /// シェル側で押したまま、まだ離していない（ドラッグで選択を広げている途中）。
+    dragging: bool,
 }
 
-impl Clicks {
+impl LeftButton {
     /// `pos` で押されたことを記録し、続けて押した回数を返す。
-    fn press(&mut self, pos: (u16, u16)) -> u8 {
+    fn press(&mut self, pos: (i32, u16)) -> u8 {
         let now = Instant::now();
         let continued = self.last.is_some_and(|(at, last_pos)| {
             last_pos == pos && now.duration_since(at) <= MULTI_CLICK_INTERVAL
@@ -304,16 +313,17 @@ impl Clicks {
 fn handle_selection(
     event: MouseEvent,
     in_shell: bool,
-    pos: (u16, u16),
+    pos: (i32, u16),
     parser: &Mutex<Parser>,
     selection: &Mutex<Option<Selection>>,
-    clicks: &mut Clicks,
+    left: &mut LeftButton,
 ) -> Option<AppEvent> {
+    left.dragging = event.pressed && (left.dragging || in_shell);
     if event.pressed && !event.is_motion() {
         // パネルの上で押したときは、選択を外すだけ
         let selected = if in_shell {
             // 仮想端末のロックは、選択のロックより先に外れる（同時に握るとデッドロックする）
-            match clicks.press(pos) {
+            match left.press(pos) {
                 2 => Selection::word(parser.lock().unwrap().screen(), pos),
                 3 => {
                     let (_, cols) = parser.lock().unwrap().screen().size();
@@ -322,14 +332,14 @@ fn handle_selection(
                 _ => Some(Selection::new(pos)),
             }
         } else {
-            *clicks = Clicks::default();
+            *left = LeftButton::default();
             None
         };
         *selection.lock().unwrap() = selected;
         return Some(AppEvent::Output);
     }
     // 単語や行を選んだあとは、ドラッグや離したときに範囲を変えない
-    if clicks.count >= 2 {
+    if left.count >= 2 {
         return None;
     }
     let mut current = selection.lock().unwrap();
@@ -350,7 +360,7 @@ fn copy_selection(
 ) -> Option<AppEvent> {
     // 選択のロックを外してから仮想端末をロックする（描画側と順番が逆になるとデッドロックする）
     let selected = selection.lock().unwrap().take()?;
-    let text = selected.text(parser.lock().unwrap().screen());
+    let text = selected.text(parser.lock().unwrap().screen_mut());
     // 何も書かれていない場所を選んだだけなら、コピーしない。
     // 空の文字をコピーすると、クリップボードに入っていた中身が消えてしまう
     if text.trim().is_empty() {
@@ -433,7 +443,7 @@ mod tests {
 
     #[test]
     fn clicks_count_up_at_the_same_place() {
-        let mut clicks = Clicks::default();
+        let mut clicks = LeftButton::default();
         assert_eq!(clicks.press((0, 0)), 1);
         assert_eq!(clicks.press((0, 0)), 2);
         assert_eq!(clicks.press((0, 0)), 3);
