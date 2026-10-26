@@ -16,11 +16,18 @@ Git が無視しているもの（`node_modules/` など）は薄く表示しま
 
 ## インストール
 
-ビルド済みのファイルをダウンロードして、`~/.local/bin` などパスの通った場所に置きます（`uname` で OS と PC の種類に合ったファイルを選びます）。
+ビルド済みのファイルをダウンロードして `~/.local/bin` に置きます（`uname` で OS と PC の種類に合ったファイルを選びます）。
 
 ```sh
-curl -L https://github.com/harumaki1220/sidels/releases/latest/download/sidels-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
-mv sidels ~/.local/bin/
+mkdir -p ~/.local/bin
+curl -L https://github.com/harumaki1220/sidels/releases/latest/download/sidels-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz -C ~/.local/bin
+```
+
+`sidels` と打って `command not found` になるときは、`~/.local/bin` がパスに入っていません。
+次の 1 行を足して、ターミナルを開き直してください（bash なら `~/.zshrc` を `~/.bashrc` に）。
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 ```
 
 Rust（1.88 以上）があれば、ソースからビルドすることもできます（C のリンカーも必要です。Ubuntu なら `sudo apt install build-essential`）。
