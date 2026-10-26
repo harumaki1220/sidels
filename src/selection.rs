@@ -26,6 +26,17 @@ pub struct Selection {
     head: (i32, u16),
 }
 
+/// 選択をドラッグしたまま、シェル側の上か下の端に来ているときの自動スクロール。
+///
+/// マウスが止まっていると位置が届かないので、入力係が端に来たことを知らせ、メインループが少しずつスクロールする。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AutoScroll {
+    /// 上の端（さかのぼる）なら `true`、下の端なら `false`。
+    pub up: bool,
+    /// マウスがある列。スクロールした先で、選択の終わりをここまで広げる。
+    pub col: u16,
+}
+
 /// 画面の `row` 行目が、履歴の中で何行目か（[`Selection`] の行の数え方）。
 pub fn history_row(screen: &vt100::Screen, row: u16) -> i32 {
     i32::from(row) - scrollback(screen)

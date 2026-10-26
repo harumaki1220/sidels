@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::AppEvent;
 use crate::mouse::{self, MouseEvent};
-use crate::selection::{Selection, SharedSelection, history_row};
+use crate::selection::{AutoScroll, Selection, SharedSelection, history_row};
 use crate::shell::Parser;
 
 /// sidels が横取りするキー。
@@ -108,13 +108,20 @@ pub fn spawn_input_thread(
                                 AppEvent::Output
                             }
                             SpecialKey::Mouse(event) => {
-                                match handle_mouse(
+                                let edge = left.edge;
+                                let handled = handle_mouse(
                                     event,
                                     &parser,
                                     &selection,
                                     &mut left,
                                     &mut writer,
-                                ) {
+                                );
+                                if left.edge != edge
+                                    && tx.send(AppEvent::AutoScroll(left.edge)).is_err()
+                                {
+                                    return;
+                                }
+                                match handled {
                                     Some(event) => event,
                                     None => continue,
                                 }
@@ -240,7 +247,23 @@ fn handle_mouse(
     };
 
     if event.is_left() {
-        return handle_selection(event, in_shell, pointer(parser), parser, selection, left);
+        let handled = handle_selection(event, in_shell, pointer(parser), parser, selection, left);
+        // ドラッグしたまま上下の端に来たら、メインループに自動でスクロールしてもらう
+        let edge = if event.row <= 1 {
+            Some(true)
+        } else if event.row >= rows {
+            Some(false)
+        } else {
+            None
+        };
+        left.edge = edge
+            // 押しただけでは始めない（一番上の行をクリックしただけでスクロールしないように）
+            .filter(|_| left.dragging && left.count < 2 && event.is_motion())
+            .map(|up| AutoScroll {
+                up,
+                col: event.col.clamp(1, cols.max(1)) - 1,
+            });
+        return handled;
     }
 
     if !event.is_wheel() || !in_shell {
@@ -285,6 +308,8 @@ struct LeftButton {
     count: u8,
     /// シェル側で押したまま、まだ離していない（ドラッグで選択を広げている途中）。
     dragging: bool,
+    /// ドラッグしたまま上下の端に来ている（自動スクロール中）。
+    edge: Option<AutoScroll>,
 }
 
 impl LeftButton {

@@ -24,7 +24,7 @@ mod shell;
 use input::spawn_input_thread;
 use layout::{PanelVisibility, pty_size_for, split};
 use panel::FilePanel;
-use selection::SharedSelection;
+use selection::{AutoScroll, SharedSelection};
 use shell::{Parser, Relay, SCROLLBACK_LINES, read_input, resize, spawn_output_thread};
 
 /// ウィンドウの大きさが変わってから、シェル側の大きさを合わせるまで待つ時間。
@@ -32,6 +32,18 @@ use shell::{Parser, Relay, SCROLLBACK_LINES, read_input, resize, spawn_output_th
 /// ドラッグ中に 1 列変わるたびに PTY を変えると、そのたびにシェルがプロンプトを描き直してちらつく。
 /// 大きさが変わらないままこの時間がたったら（ドラッグが止まったら）、まとめて 1 回だけ変える。
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
+
+/// 選択をドラッグしたまま端に来ているとき、スクロールする間隔。
+const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// 自動スクロールで 1 回に動かす行数の、最初と最大。
+///
+/// 端で止めている時間が長いほど速くする。少しだけ選びたいときは細かく合わせられ、
+/// ずっと上まで行きたいときは待っていれば速くなる。
+const AUTO_SCROLL_LINES: (usize, usize) = (2, 10);
+
+/// 自動スクロールで 1 回に動かす行数を 1 増やすまでの時間。
+const AUTO_SCROLL_SPEEDUP: Duration = Duration::from_millis(250);
 
 /// 外側のターミナルのタイトルを保存する（XTWINOPS 22）。
 ///
@@ -56,6 +68,8 @@ enum AppEvent {
     /// 画面への書き込みはメインループだけが行うので、入力係（選んだ文字）から頼む。
     /// 外側が OSC 52 を受け付けないときは、出力係（中のアプリがコピーした文字）からも頼む。
     Copy(String),
+    /// 選択をドラッグしたまま上下の端に来た（`Some`）、または端から離れた・指を離した（`None`）。
+    AutoScroll(Option<AutoScroll>),
     /// パネルの上でホイールが回された。パネルの一覧をこの行数だけスクロールする（負なら上へ）。
     ScrollPanel(isize),
     /// 中のアプリが出した制御文字列を、外側のターミナルにそのまま送ってほしい。
@@ -151,6 +165,10 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut last_layout = None;
     // 合わせたいシェル側の大きさと、その大きさになった時刻（RESIZE_SETTLE だけ待ってから合わせる）
     let mut pending_resize: Option<(PtySize, Instant)> = None;
+    // 選択をドラッグしたまま端に来ているときの自動スクロールと、始めた時刻・最後にスクロールした時刻
+    let mut auto_scroll: Option<AutoScroll> = None;
+    let mut auto_scroll_since = None;
+    let mut last_auto_scroll = Instant::now();
     loop {
         // ウィンドウの大きさが変わっていたら、PTYと仮想端末も合わせる
         let size = terminal.size()?;
@@ -203,12 +221,24 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             needs_draw |= panel.update(foreground, &line, &word);
         }
 
+        // 端に来たまま列だけ動いたときは、速さを最初に戻さない
+        auto_scroll_since = auto_scroll.and(auto_scroll_since.or_else(|| Some(Instant::now())));
+        if let (Some(edge), Some(since)) = (auto_scroll, auto_scroll_since)
+            && last_auto_scroll.elapsed() >= AUTO_SCROLL_INTERVAL
+        {
+            last_auto_scroll = Instant::now();
+            let (first, max) = AUTO_SCROLL_LINES;
+            let speedup = since.elapsed().as_millis() / AUTO_SCROLL_SPEEDUP.as_millis();
+            let lines = (first + usize::try_from(speedup).unwrap_or(max)).min(max);
+            needs_draw |= scroll_selection(&parser, &selection, edge, lines);
+        }
+
         if needs_draw {
             needs_draw = false;
             draw(terminal, &parser, &selection, &panel, panel_visible)?;
         }
 
-        match wait_for_event(&rx, &mut visibility, &mut panel)? {
+        match wait_for_event(&rx, &mut visibility, &mut panel, &mut auto_scroll)? {
             Wake::Exited => break,
             Wake::Changed => needs_draw = true,
             Wake::Idle => {}
@@ -217,6 +247,42 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
     child.wait()?;
     Ok(())
+}
+
+/// 自動スクロールで `lines` 行動かし、選択の終わりを端の行の `edge.col` まで広げる。
+///
+/// 動いたら `true`（履歴の一番上や今の画面に着いたら、もう動かない）。
+fn scroll_selection(
+    parser: &Mutex<Parser>,
+    selection: &SharedSelection,
+    edge: AutoScroll,
+    lines: usize,
+) -> bool {
+    // 2 つのロックを同時に握らないよう、仮想端末を先に済ませる
+    let head = {
+        let mut parser = parser.lock().unwrap();
+        let screen = parser.screen_mut();
+        let before = screen.scrollback();
+        let after = if edge.up {
+            before + lines
+        } else {
+            before.saturating_sub(lines)
+        };
+        screen.set_scrollback(after);
+        if screen.scrollback() == before {
+            return false;
+        }
+        let row = if edge.up {
+            0
+        } else {
+            screen.size().0.saturating_sub(1)
+        };
+        (selection::history_row(screen, row), edge.col)
+    };
+    if let Some(selected) = selection.lock().unwrap().as_mut() {
+        selected.extend(head);
+    }
+    true
 }
 
 /// シェル側とパネルを描く。
@@ -286,6 +352,7 @@ fn wait_for_event(
     rx: &Receiver<AppEvent>,
     visibility: &mut PanelVisibility,
     panel: &mut FilePanel,
+    auto_scroll: &mut Option<AutoScroll>,
 ) -> Result<Wake> {
     let first = match rx.recv_timeout(Duration::from_millis(50)) {
         Ok(event) => event,
@@ -304,6 +371,7 @@ fn wait_for_event(
             // 読み込みが終わっただけでは描き直さない。中身が変わったかは panel.update が判断する
             AppEvent::PanelLoaded => {}
             AppEvent::ScrollPanel(lines) => changed |= panel.scroll(lines),
+            AppEvent::AutoScroll(edge) => *auto_scroll = edge,
             AppEvent::Copy(text) if selection::uses_pbcopy() => {
                 selection::pbcopy(text.into_bytes())
             }
