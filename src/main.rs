@@ -72,6 +72,8 @@ enum AppEvent {
     AutoScroll(Option<AutoScroll>),
     /// パネルの上でホイールが回された。パネルの一覧をこの行数だけスクロールする（負なら上へ）。
     ScrollPanel(isize),
+    /// シェル連携から、入力中の内容が届いた（`line` は入力欄の中身、`word` はカーソル直前の単語）。
+    ShellInput { line: String, word: String },
     /// 中のアプリが出した制御文字列を、外側のターミナルにそのまま送ってほしい。
     ///
     /// クリップボードへの書き込み（OSC 52）、タイトル、今いる場所（OSC 7）。出力係から頼む。
@@ -79,6 +81,21 @@ enum AppEvent {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => {}
+        ["init", "zsh"] => {
+            print!("{}", shell::ZSH_INIT);
+            return Ok(());
+        }
+        _ => {
+            eprintln!(
+                "使い方: sidels（起動）/ sidels init zsh（.zshrc で eval するシェル連携を出力）"
+            );
+            std::process::exit(2);
+        }
+    }
+
     // rawモード + 別画面に切り替える。パニックしても自動で元に戻る
     let mut terminal = ratatui::init();
     // 外側のターミナルに、貼り付けた文字を印で囲んで送ってもらう。
@@ -169,6 +186,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut auto_scroll: Option<AutoScroll> = None;
     let mut auto_scroll_since = None;
     let mut last_auto_scroll = Instant::now();
+    // シェル連携から届いた入力中の内容。一度でも届いたら、画面から読む代わりにこれを使う
+    let mut reported_input: Option<(String, String)> = None;
     loop {
         // ウィンドウの大きさが変わっていたら、PTYと仮想端末も合わせる
         let size = terminal.size()?;
@@ -214,7 +233,10 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 .and_then(|pid| u32::try_from(pid).ok());
             // シェル以外（Claude Code など）が前面のときは、打っている文字はコマンドではないので反応しない
             let (line, word) = if foreground.is_none() || foreground == shell_pid {
-                read_input(&parser.lock().unwrap())
+                // 画面から読むと、zsh-autosuggestions の灰色の候補なども打った文字として読んでしまう
+                reported_input
+                    .clone()
+                    .unwrap_or_else(|| read_input(&parser.lock().unwrap()))
             } else {
                 (String::new(), String::new())
             };
@@ -238,7 +260,13 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             draw(terminal, &parser, &selection, &panel, panel_visible)?;
         }
 
-        match wait_for_event(&rx, &mut visibility, &mut panel, &mut auto_scroll)? {
+        match wait_for_event(
+            &rx,
+            &mut visibility,
+            &mut panel,
+            &mut auto_scroll,
+            &mut reported_input,
+        )? {
             Wake::Exited => break,
             Wake::Changed => needs_draw = true,
             Wake::Idle => {}
@@ -353,6 +381,7 @@ fn wait_for_event(
     visibility: &mut PanelVisibility,
     panel: &mut FilePanel,
     auto_scroll: &mut Option<AutoScroll>,
+    reported_input: &mut Option<(String, String)>,
 ) -> Result<Wake> {
     let first = match rx.recv_timeout(Duration::from_millis(50)) {
         Ok(event) => event,
@@ -372,6 +401,8 @@ fn wait_for_event(
             AppEvent::PanelLoaded => {}
             AppEvent::ScrollPanel(lines) => changed |= panel.scroll(lines),
             AppEvent::AutoScroll(edge) => *auto_scroll = edge,
+            // パネルに反映するかは panel.update が判断する
+            AppEvent::ShellInput { line, word } => *reported_input = Some((line, word)),
             AppEvent::Copy(text) if selection::uses_pbcopy() => {
                 selection::pbcopy(text.into_bytes())
             }

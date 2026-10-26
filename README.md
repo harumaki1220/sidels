@@ -27,7 +27,7 @@ curl -L https://github.com/harumaki1220/sidels/releases/latest/download/sidels-$
 次の 1 行を足して、ターミナルを開き直してください（bash なら `~/.zshrc` を `~/.bashrc` に）。
 
 ```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> ~/.zshrc
 ```
 
 Rust（1.88 以上）があれば、ソースからビルドすることもできます（C のリンカーも必要です。Ubuntu なら `sudo apt install build-essential`）。
@@ -37,6 +37,16 @@ cargo install --locked --git https://github.com/harumaki1220/sidels
 ```
 
 `sidels` で起動し、`exit` でシェルを終えると一緒に終了します。
+
+### zsh との連携（任意）
+
+zsh を使っているなら、`.zshrc` に次の 1 行を足すと、打ちかけのコマンドを zsh から直接受け取るようになります。
+足さなくても使えますが、zsh-autosuggestions の灰色の候補にパネルが反応しなくなるなど、より正確になります。
+sidels の外で開いた zsh では何もしないので、書いたままで大丈夫です（zsh 5.3 以上）。
+
+```zsh
+eval "$(sidels init zsh)"
+```
 
 ## 操作
 
@@ -57,7 +67,7 @@ sidels は、ターミナルの中にもう 1 つ小さなターミナルを作�
 - マウス操作を受け取るので、Windows Terminal の右クリック貼り付けは効きません（Ctrl+V は使えます）
 - コピーは、ターミナルの OSC 52 という仕組みでクリップボードに入れます（Windows Terminal、iTerm2、Ghostty などは対応しています）。macOS 標準の Terminal.app は非対応なので、代わりに `pbcopy` を使います
 - 中のアプリ（vim や Claude Code など）が出したコピー、ウィンドウのタイトル、今いる場所の知らせ（OSC 7）は、外側のターミナルにそのまま伝えます
-- 入力中の内容は画面から読み取っているので、zsh-autosuggestions の灰色の候補にも反応することがあります
+- zsh との連携を設定していないときは、入力中の内容を画面から読み取るので、zsh-autosuggestions の灰色の候補にも反応することがあります
 - 中のシェルには `SIDELS=1` が渡ります。`.zshrc` から sidels を自動で起動するときに、入れ子にならないようにするのに使えます
 
 ## ライセンス

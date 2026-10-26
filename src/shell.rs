@@ -1,6 +1,7 @@
 //! シェル側。
 //!
 //! PTY の出力を仮想端末（vt100）に流し込み、その画面から入力中の内容を読む。
+//! シェル連携（[`ZSH_INIT`]）を読み込んだ zsh からは、入力中の内容が直接届くので、それを使う。
 //! 中のアプリが出したクリップボードへの書き込み（OSC 52）、タイトル、今いる場所（OSC 7）は、外側のターミナルに伝える。
 
 use std::io::Read;
@@ -15,6 +16,16 @@ use crate::{AppEvent, selection};
 
 /// 左ペインの履歴として覚えておく行数。
 pub const SCROLLBACK_LINES: usize = 10_000;
+
+/// `sidels init zsh` が出力する、zsh 用のシェル連携。
+///
+/// 入力欄が変わるたびに、[`INPUT_REPORT`] で始まる OSC でカーソル位置と中身を知らせてもらう。
+pub const ZSH_INIT: &str = include_str!("init.zsh");
+
+/// シェル連携が入力中の内容を知らせる OSC の、番号と目印。
+///
+/// 続きは `カーソル位置（文字数）; 入力欄の中身`。どのターミナルも使っていない番号にしてあり、外側には伝えない。
+const INPUT_REPORT: [&[u8]; 2] = [b"7777", b"sidels"];
 
 /// シェルの出力を解釈して、今の画面をメモリ上に持つ仮想端末。
 pub type Parser = vt100::Parser<Relay>;
@@ -59,10 +70,34 @@ impl vt100::Callbacks for Relay {
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if let [number, tag, cursor, buffer @ ..] = params
+            && [*number, *tag] == INPUT_REPORT
+        {
+            if let Some((line, word)) = parse_input_report(cursor, buffer) {
+                let _ = self.tx.send(AppEvent::ShellInput { line, word });
+            }
+            return;
+        }
         if is_relayed_osc(params) {
             self.pass_through([b"\x1b]", params.join(&b';').as_slice(), b"\x07"].concat());
         }
     }
+}
+
+/// シェル連携から届いたカーソル位置と入力欄の中身を、[`read_input`] と同じ `(行, カーソル直前の単語)` にする。
+///
+/// 入力欄の中身に `;` が残っていると vt100 が区切ってしまうので、つなげ直す。
+fn parse_input_report(cursor: &[u8], buffer: &[&[u8]]) -> Option<(String, String)> {
+    let cursor: usize = std::str::from_utf8(cursor).ok()?.parse().ok()?;
+    let line = String::from_utf8_lossy(&buffer.join(&b';')).into_owned();
+    // zsh の CURSOR は、バイト数ではなく文字数
+    let before: String = line.chars().take(cursor).collect();
+    let word = before
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    Some((line, word))
 }
 
 /// vt100 が扱わない OSC のうち、外側のターミナルに伝えるものか。
@@ -196,6 +231,35 @@ mod tests {
                 b"\x1b]9;9;/home\x07",
             ]
         );
+    }
+
+    #[test]
+    fn input_report_becomes_shell_input_and_is_not_relayed() {
+        let (tx, rx) = mpsc::channel();
+        let mut parser = Parser::new_with_callbacks(24, 80, 0, Relay::new(tx));
+        parser.process("\x1b]7777;sidels;6;cd sr日 x\x07".as_bytes());
+        drop(parser);
+        let events: Vec<_> = rx.iter().collect();
+        assert!(matches!(
+            &events[..],
+            [AppEvent::ShellInput { line, word }] if line == "cd sr日 x" && word == "sr日"
+        ));
+    }
+
+    #[test]
+    fn input_report_rejoins_semicolons_and_handles_edges() {
+        let report = |cursor: &[u8], buffer: &[&[u8]]| parse_input_report(cursor, buffer);
+        assert_eq!(
+            report(b"9", &[b"a", b"ls *.lo"]),
+            Some(("a;ls *.lo".into(), "*.lo".into()))
+        );
+        // 空白の直後や空の入力欄では、単語は空
+        assert_eq!(
+            report(b"4", &[b"vim "]),
+            Some(("vim ".into(), String::new()))
+        );
+        assert_eq!(report(b"0", &[b""]), Some((String::new(), String::new())));
+        assert_eq!(report(b"x", &[b"ls"]), None);
     }
 
     #[test]
