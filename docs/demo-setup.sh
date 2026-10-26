@@ -24,6 +24,8 @@ find . -path ./.git -prune -o -exec touch -d '1 hour ago' {} +
 
 # 中で動かすシェル: 短いプロンプトと、sidels のシェル連携だけの zsh
 cat > "$demo/zdotdir/.zshrc" <<'ZSHRC'
+# 環境変数の VISUAL などが vim だと vi 風のキー操作になり、台本の Ctrl+U が行を消さなくなる
+bindkey -e
 PROMPT='%F{blue}%~%f %F{green}❯%f '
 eval "$(sidels init zsh)"
 ZSHRC
