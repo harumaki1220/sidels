@@ -37,6 +37,7 @@ cargo install --locked --git https://github.com/harumaki1220/sidels
 ```
 
 `sidels` で起動し、`exit` でシェルを終えると一緒に終了します。
+Nerd Font を使っているなら、`sidels --icons` で起動するとファイルの種類ごとのアイコンが付きます（持っていないと文字化けするので、最初はオフです）。
 
 ### zsh との連携（任意）
 

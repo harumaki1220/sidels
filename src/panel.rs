@@ -111,6 +111,8 @@ pub struct FilePanel {
     scroll: usize,
     /// 最後に描いたときの、一覧に使える行数。スクロールしすぎないように覚えておく。
     rows: Cell<usize>,
+    /// 名前の前にファイルの種類のアイコン（[`icon`]）を付ける（`--icons`）。
+    icons: bool,
 }
 
 /// パネルの 1 行（ファイルまたはディレクトリ）。
@@ -133,6 +135,7 @@ impl FilePanel {
     pub fn new(
         shell_pid: Option<u32>,
         start_dir: PathBuf,
+        icons: bool,
         on_loaded: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         let on_loaded: Arc<dyn Fn() + Send + Sync> = Arc::new(on_loaded);
@@ -171,6 +174,7 @@ impl FilePanel {
             filter: String::new(),
             scroll: 0,
             rows: Cell::new(0),
+            icons,
         }
     }
 
@@ -282,11 +286,14 @@ impl FilePanel {
                 let inner = block.inner(area);
                 let rows = usize::from(inner.height);
                 // Git の印の 2 列を除いた、名前に使える幅
+                // Git の印とアイコンの、それぞれ 2 列（文字と空白）を除いた、名前に使える幅
                 let mark_width = if self.git.is_some() { 2 } else { 0 };
-                let name_width = usize::from(inner.width).saturating_sub(mark_width);
+                let icon_width = if self.icons { 2 } else { 0 };
+                let name_width = usize::from(inner.width).saturating_sub(mark_width + icon_width);
                 let git = self.git.as_ref();
                 let item = |entry: &&Entry| {
-                    entry.to_list_item(git, self.recent.contains(&entry.name), name_width)
+                    let recent = self.recent.contains(&entry.name);
+                    entry.to_list_item(git, recent, self.icons, name_width)
                 };
                 let deleted = self.deleted_entries();
                 let entries = self.visible_entries(&deleted);
@@ -528,12 +535,13 @@ impl Entry {
     /// パネルの 1 行にする。
     ///
     /// `git` は表示中のディレクトリの Git の状態（Git の管理下でなければ `None`）。
-    /// `recent` なら名前の後ろに ● を付ける（最近書き換えられた）。
+    /// `recent` なら名前の後ろに ● を付ける（最近書き換えられた）。`icons` なら名前の前にアイコンを付ける。
     /// 名前は `name_width` 列に収まるよう、長ければ真ん中を省略する。
     fn to_list_item(
         &self,
         git: Option<&GitStatus>,
         recent: bool,
+        icons: bool,
         name_width: usize,
     ) -> ListItem<'static> {
         // ● の 2 列（空白と ●）の分だけ、名前を短くする
@@ -579,11 +587,55 @@ impl Entry {
                 None => Span::raw("  "),
             });
         }
+        if icons {
+            // Nerd Font のアイコンは 1 列からはみ出して描かれることがあるので、空白を挟む
+            spans.push(Span::styled(
+                format!("{} ", icon(&self.name, self.is_dir)),
+                style,
+            ));
+        }
         spans.push(Span::styled(text, style));
         if recent {
             spans.push(Span::styled(" ●", Style::default().fg(Color::Cyan)));
         }
         ListItem::new(Line::from(spans))
+    }
+}
+
+/// `--icons` のときに名前の前に付ける、ファイルの種類のアイコン（Nerd Font の文字）。
+///
+/// 名前そのもので決まるもの（`Dockerfile` など）を先に見て、なければ拡張子で決める。
+fn icon(name: &str, is_dir: bool) -> char {
+    if is_dir {
+        return '\u{f07b}'; // フォルダ
+    }
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
+        "dockerfile" => return '\u{e7b0}',
+        ".gitignore" | ".gitattributes" | ".gitmodules" => return '\u{e702}',
+        "license" | "licence" => return '\u{f0f6}',
+        _ => {}
+    }
+    // `.zshrc` のような名前は、`.` の後ろ全体を拡張子とみなす
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+    match ext {
+        "rs" => '\u{e7a8}',
+        "md" | "markdown" => '\u{e73e}',
+        "py" => '\u{e73c}',
+        "js" | "mjs" | "cjs" | "jsx" => '\u{e74e}',
+        "ts" | "tsx" => '\u{e628}',
+        "json" => '\u{e60b}',
+        "toml" | "yaml" | "yml" | "ini" | "conf" => '\u{e615}',
+        "html" | "htm" => '\u{e736}',
+        "css" | "scss" => '\u{e749}',
+        "c" | "h" => '\u{e61e}',
+        "cpp" | "cc" | "hpp" => '\u{e61d}',
+        "sh" | "bash" | "zsh" | "bashrc" | "zshrc" | "zshenv" | "profile" => '\u{e795}',
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => '\u{f1c5}',
+        "zip" | "tar" | "gz" | "tgz" | "xz" | "7z" => '\u{f1c6}',
+        "lock" => '\u{f023}',
+        "txt" | "log" => '\u{f0f6}',
+        _ => '\u{f016}', // 普通のファイル
     }
 }
 
@@ -895,6 +947,17 @@ fn glob_matches(glob: &GlobMatcher, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_by_name_then_extension() {
+        assert_eq!(icon("src", true), '\u{f07b}');
+        assert_eq!(icon("main.rs", false), '\u{e7a8}');
+        assert_eq!(icon("README.MD", false), '\u{e73e}');
+        assert_eq!(icon("Dockerfile", false), '\u{e7b0}');
+        assert_eq!(icon(".zshrc", false), '\u{e795}');
+        assert_eq!(icon("Cargo.lock", false), '\u{f023}');
+        assert_eq!(icon("Makefile", false), '\u{f016}');
+    }
 
     #[test]
     fn fit_name_keeps_short_names() {

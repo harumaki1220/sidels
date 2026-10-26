@@ -53,6 +53,14 @@ const SAVE_TITLE: &[u8] = b"\x1b[22;0t";
 /// [`SAVE_TITLE`] で保存したタイトルに戻す（XTWINOPS 23）。
 const RESTORE_TITLE: &[u8] = b"\x1b[23;0t";
 
+/// `sidels --help` や、知らない引数のときに出す使い方。
+const USAGE: &str = "\
+使い方:
+  sidels            起動する
+  sidels --icons    ファイルの種類ごとのアイコンを付けて起動する（Nerd Font が必要）
+  sidels init zsh   zsh のシェル連携を出力する（.zshrc に eval \"$(sidels init zsh)\" と書く）
+";
+
 /// 別スレッドからメインループに届く知らせ。
 enum AppEvent {
     /// シェルが何か出力した、またはスクロールした（描き直しが必要）。
@@ -82,19 +90,24 @@ enum AppEvent {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] => {}
+    // アイコンは Nerd Font がないと文字化けするが、フォントは外側のターミナルが決めていて調べられない。
+    // なので、使いたい人だけ引数でオンにする
+    let icons = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => false,
+        ["--icons"] => true,
         ["init", "zsh"] => {
             print!("{}", shell::ZSH_INIT);
             return Ok(());
         }
+        ["-h" | "--help"] => {
+            print!("{USAGE}");
+            return Ok(());
+        }
         _ => {
-            eprintln!(
-                "使い方: sidels（起動）/ sidels init zsh（.zshrc で eval するシェル連携を出力）"
-            );
+            eprint!("{USAGE}");
             std::process::exit(2);
         }
-    }
+    };
 
     // rawモード + 別画面に切り替える。パニックしても自動で元に戻る
     let mut terminal = ratatui::init();
@@ -111,7 +124,7 @@ fn main() -> Result<()> {
         ratatui_hook(info);
     }));
     // run の中で ? によるエラーが起きても、必ず restore まで来る
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, icons);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = write_raw(mouse::DISABLE);
     let _ = write_raw(RESTORE_TITLE);
@@ -127,7 +140,9 @@ fn write_raw(bytes: &[u8]) -> io::Result<()> {
 }
 
 /// シェルを起動し、終了するまで画面を描き続ける。
-fn run(terminal: &mut DefaultTerminal) -> Result<()> {
+///
+/// `icons` なら、パネルにファイルの種類ごとのアイコンを付ける。
+fn run(terminal: &mut DefaultTerminal, icons: bool) -> Result<()> {
     let size = terminal.size()?;
     let mut visibility = PanelVisibility::new(size.width);
     let (left, _) = split(
@@ -153,7 +168,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     // パネルはディレクトリを別スレッドで読む。読み終わったら描き直しを頼む
     let panel_tx = tx.clone();
     let shell_pid = child.process_id();
-    let mut panel = FilePanel::new(shell_pid, std::env::current_dir()?, move || {
+    let mut panel = FilePanel::new(shell_pid, std::env::current_dir()?, icons, move || {
         let _ = panel_tx.send(AppEvent::PanelLoaded);
     });
 
