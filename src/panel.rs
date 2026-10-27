@@ -661,11 +661,14 @@ impl Entry {
             });
         }
         if icons {
+            let (symbol, color) = icon(&self.name, self.is_dir);
+            // 薄くする・光らせるなどは名前と揃え、色だけ種類ごとに変える。消したファイルは名前と同じ赤のまま
+            let icon_style = match color {
+                Some(color) if !self.deleted => style.fg(color),
+                _ => style,
+            };
             // Nerd Font のアイコンは 1 列からはみ出して描かれることがあるので、空白を挟む
-            spans.push(Span::styled(
-                format!("{} ", icon(&self.name, self.is_dir)),
-                style,
-            ));
+            spans.push(Span::styled(format!("{symbol} "), icon_style));
         }
         spans.push(Span::styled(text, style));
         if recent {
@@ -675,41 +678,61 @@ impl Entry {
     }
 }
 
-/// `--icons` のときに名前の前に付ける、ファイルの種類のアイコン（Nerd Font の文字）。
+/// `--icons` のときに名前の前に付ける、ファイルの種類のアイコン（Nerd Font の文字）と色。
 ///
 /// 名前そのもので決まるもの（`Dockerfile` など）を先に見て、なければ拡張子で決める。
-fn icon(name: &str, is_dir: bool) -> char {
+/// 色は nvim-web-devicons（MIT）の表に合わせる。yazi や eza なども同じ表を使っていて、見慣れた色になるため。
+/// 表にない拡張子は、近い仲間の色にする。`None` なら名前と同じ色にする（フォルダは青、そのほかは色なし）。
+fn icon(name: &str, is_dir: bool) -> (char, Option<Color>) {
     if is_dir {
-        return '\u{f07b}'; // フォルダ
+        return ('\u{f07b}', None); // フォルダ
     }
     let name = name.to_ascii_lowercase();
     match name.as_str() {
-        "dockerfile" => return '\u{e7b0}',
-        ".gitignore" | ".gitattributes" | ".gitmodules" => return '\u{e702}',
-        "license" | "licence" => return '\u{f0f6}',
+        "dockerfile" => return ('\u{e7b0}', rgb(0x458EE6)),
+        ".gitignore" | ".gitattributes" | ".gitmodules" => return ('\u{e702}', rgb(0xF54D27)),
+        "license" | "licence" => return ('\u{f0f6}', rgb(0xD0BF41)),
         _ => {}
     }
     // `.zshrc` のような名前は、`.` の後ろ全体を拡張子とみなす
     let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
     match ext {
-        "rs" => '\u{e7a8}',
-        "md" | "markdown" => '\u{e73e}',
-        "py" => '\u{e73c}',
-        "js" | "mjs" | "cjs" | "jsx" => '\u{e74e}',
-        "ts" | "tsx" => '\u{e628}',
-        "json" => '\u{e60b}',
-        "toml" | "yaml" | "yml" | "ini" | "conf" => '\u{e615}',
-        "html" | "htm" => '\u{e736}',
-        "css" | "scss" => '\u{e749}',
-        "c" | "h" => '\u{e61e}',
-        "cpp" | "cc" | "hpp" => '\u{e61d}',
-        "sh" | "bash" | "zsh" | "bashrc" | "zshrc" | "zshenv" | "profile" => '\u{e795}',
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => '\u{f1c5}',
-        "zip" | "tar" | "gz" | "tgz" | "xz" | "7z" => '\u{f1c6}',
-        "lock" => '\u{f023}',
-        "txt" | "log" => '\u{f0f6}',
-        _ => '\u{f016}', // 普通のファイル
+        "rs" => ('\u{e7a8}', rgb(0xDEA584)),
+        "md" | "markdown" => ('\u{e73e}', rgb(0xDDDDDD)),
+        "py" => ('\u{e73c}', rgb(0xFFBC03)),
+        "js" | "cjs" => ('\u{e74e}', rgb(0xCBCB41)),
+        "mjs" => ('\u{e74e}', rgb(0xF1E05A)),
+        "jsx" => ('\u{e74e}', rgb(0x20C2E3)),
+        "ts" => ('\u{e628}', rgb(0x519ABA)),
+        "tsx" => ('\u{e628}', rgb(0x1354BF)),
+        "json" => ('\u{e60b}', rgb(0xCBCB41)),
+        "toml" => ('\u{e615}', rgb(0x9C4221)),
+        "yaml" | "yml" => ('\u{e615}', rgb(0xD70000)),
+        "ini" | "conf" => ('\u{e615}', rgb(0x6D8086)),
+        "html" => ('\u{e736}', rgb(0xE44D26)),
+        "htm" => ('\u{e736}', rgb(0xE34C26)),
+        "css" => ('\u{e749}', rgb(0x663399)),
+        "scss" => ('\u{e749}', rgb(0xF55385)),
+        "c" => ('\u{e61e}', rgb(0x599EFF)),
+        "h" | "hpp" => ('\u{e61e}', rgb(0xA074C4)),
+        "cpp" => ('\u{e61d}', rgb(0x519ABA)),
+        "cc" => ('\u{e61d}', rgb(0xF34B7D)),
+        "sh" => ('\u{e795}', rgb(0x4D5A5E)),
+        "bash" | "zsh" | "bashrc" | "zshrc" | "zshenv" | "profile" => ('\u{e795}', rgb(0x89E051)),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => ('\u{f1c5}', rgb(0xA074C4)),
+        "svg" => ('\u{f1c5}', rgb(0xFFB13B)),
+        "ico" => ('\u{f1c5}', rgb(0xCBCB41)),
+        "zip" | "tar" | "gz" | "tgz" | "xz" | "7z" => ('\u{f1c6}', rgb(0xECA517)),
+        "lock" => ('\u{f023}', rgb(0xBBBBBB)),
+        "txt" => ('\u{f0f6}', rgb(0x89E051)),
+        "log" => ('\u{f0f6}', rgb(0xDDDDDD)),
+        _ => ('\u{f016}', None), // 普通のファイル
     }
+}
+
+/// `0xRRGGBB` の色。
+const fn rgb(hex: u32) -> Option<Color> {
+    Some(Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8))
 }
 
 /// 名前を `max` 列に収める（ディレクトリには最後に `/` を付ける）。
@@ -1023,13 +1046,22 @@ mod tests {
 
     #[test]
     fn icon_by_name_then_extension() {
-        assert_eq!(icon("src", true), '\u{f07b}');
-        assert_eq!(icon("main.rs", false), '\u{e7a8}');
-        assert_eq!(icon("README.MD", false), '\u{e73e}');
-        assert_eq!(icon("Dockerfile", false), '\u{e7b0}');
-        assert_eq!(icon(".zshrc", false), '\u{e795}');
-        assert_eq!(icon("Cargo.lock", false), '\u{f023}');
-        assert_eq!(icon("Makefile", false), '\u{f016}');
+        let symbol = |name, is_dir| icon(name, is_dir).0;
+        assert_eq!(symbol("src", true), '\u{f07b}');
+        assert_eq!(symbol("main.rs", false), '\u{e7a8}');
+        assert_eq!(symbol("README.MD", false), '\u{e73e}');
+        assert_eq!(symbol("Dockerfile", false), '\u{e7b0}');
+        assert_eq!(symbol(".zshrc", false), '\u{e795}');
+        assert_eq!(symbol("Cargo.lock", false), '\u{f023}');
+        assert_eq!(symbol("Makefile", false), '\u{f016}');
+    }
+
+    #[test]
+    fn icon_colors_follow_the_kind() {
+        assert_eq!(icon("main.rs", false).1, Some(Color::Rgb(0xDE, 0xA5, 0x84)));
+        // フォルダと、種類の分からないものは名前の色のまま
+        assert_eq!(icon("src", true).1, None);
+        assert_eq!(icon("Makefile", false).1, None);
     }
 
     #[test]
