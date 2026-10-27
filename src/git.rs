@@ -2,10 +2,12 @@
 //!
 //! パネルに表示しているディレクトリの各ファイルに、変更がある・新しい・`git add` 済み、などの印を付ける。
 //! 今のブランチと、リモートとのコミットの差も調べる。
+//! 指定されたコミットと時刻より後に変わったファイルも調べる（前面のプログラムの作業で変わったものに ● を付けるため）。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::SystemTime;
 
 /// 印の種類。
 ///
@@ -40,6 +42,11 @@ pub struct GitStatus {
     pub marks: HashMap<String, GitMark>,
     /// 直下にあるもののうち、Git で管理している（最後のコミットに入っている）ものの名前。
     pub tracked: HashSet<String>,
+    /// 今のコミット。まだコミットがなければ `None`。
+    pub head: Option<String>,
+    /// [`status`] の `since` のコミットから中身が変わり、`since` の時刻より後に書き換えられた、直下の名前。
+    /// サブディレクトリは、中に当てはまるものがあればその名前。
+    pub changed_since: HashSet<String>,
 }
 
 /// 今のブランチと、リモート（upstream）とのコミットの差。
@@ -54,7 +61,11 @@ pub struct Branch {
 }
 
 /// `dir` の Git の状態。`dir` が Git の管理下でなければ `None`。
-pub fn status(dir: &Path) -> Option<GitStatus> {
+///
+/// `since` に `(コミット, 時刻)` を渡すと、そのコミットから中身が変わり、その時刻より後に書き換えられた名前も調べる
+/// （[`GitStatus::changed_since`]）。時刻も見るのは、それより前からあった変更を外すため。
+/// 別のリポジトリのコミットなどで比べられなければ、空にする。
+pub fn status(dir: &Path, since: Option<(&str, SystemTime)>) -> Option<GitStatus> {
     // リポジトリの一番上から見た dir の位置（"src/" など）。status のパスはここからの相対になる
     let prefix = git(dir, &["rev-parse", "--show-prefix"])?;
     // -b を付けると、最初の 1 件がブランチの情報（`## main...origin/main [ahead 1]`）になる
@@ -70,11 +81,39 @@ pub fn status(dir: &Path) -> Option<GitStatus> {
                 .collect()
         })
         .unwrap_or_default();
+    let head = git(dir, &["rev-parse", "HEAD"]).map(|head| head.trim_end().to_string());
+    // --relative で、dir の中のものだけを dir からの相対パスで出す。
+    // 作業ツリーと比べるので、まだ add していない変更も、もうコミットした変更も入る
+    let changed_since = since
+        .and_then(|(commit, time)| {
+            let paths = git(dir, &["diff", "--name-only", "-z", "--relative", commit])?;
+            // 消したファイルは時刻が分からないので、変わったものに入れる
+            let written_after = |path: &&str| {
+                std::fs::symlink_metadata(dir.join(path))
+                    .and_then(|meta| meta.modified())
+                    .map_or(true, |modified| modified >= time)
+            };
+            let paths: Vec<&str> = paths.split('\0').filter(written_after).collect();
+            Some(top_level_names(&paths.join("\0")))
+        })
+        .unwrap_or_default();
     Some(GitStatus {
         branch: parse_branch(header.strip_prefix("## ").unwrap_or_default()),
         marks: parse(rest, prefix.trim_end_matches('\n')),
         tracked,
+        head,
+        changed_since,
     })
+}
+
+/// `\0` 区切りのパスの一覧を、一番上の名前（`src/main.rs` なら `src`）にまとめる。
+fn top_level_names(paths: &str) -> HashSet<String> {
+    paths
+        .split('\0')
+        .filter_map(|path| path.split('/').next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// `git status -b` の 1 件目（`## ` の後ろ）から、ブランチ名とコミットの差を読む。
@@ -242,6 +281,15 @@ mod tests {
         // src/ を見ているときは、src の中の名前に印が付き、外のものは出ない
         let marks = parse(output, "src/");
         assert_eq!(letters(&marks), [("main.rs", 'M')]);
+    }
+
+    #[test]
+    fn top_level_names_groups_paths_by_first_component() {
+        let names = top_level_names("src/main.rs\0src/lib.rs\0README.md\0");
+        let mut names: Vec<_> = names.into_iter().collect();
+        names.sort();
+        assert_eq!(names, ["README.md", "src"]);
+        assert!(top_level_names("").is_empty());
     }
 
     #[test]

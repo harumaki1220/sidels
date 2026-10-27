@@ -2,7 +2,7 @@
 //!
 //! シェルの現在地の中身を表示し、入力中のコマンドラインに合わせて
 //! 移動先のプレビュー・絞り込み・glob ハイライトを行う。Git の管理下なら、変更のあるファイルに印を付ける。
-//! 最近書き換えられたファイルには、名前の後ろに ● を付ける。
+//! 最近書き換えられたファイルと、前面のプログラム（Claude Code など）を起動してから変わったファイルには、名前の後ろに ● を付ける。
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -54,10 +54,31 @@ const MTIME_MAX_ENTRIES: usize = 1000;
 /// どのディレクトリを調べたかと、ファイル名ごとの更新時刻（調べなかったなら `None`）。
 type MtimeLoaded = (PathBuf, Option<HashMap<String, SystemTime>>);
 
+/// Git 係への依頼。調べるディレクトリと、変わったものを調べるときに比べるコミットと時刻（[`git::status`]）。
+type GitRequest = (PathBuf, Option<(String, SystemTime)>);
+
 /// Git 係から届く結果。
 ///
-/// どのディレクトリを調べたかと、その Git の状態（Git の管理下でなければ `None`）。
-type GitLoaded = (PathBuf, Option<GitStatus>);
+/// どの依頼の結果かと、その Git の状態（Git の管理下でなければ `None`）。
+type GitLoaded = (GitRequest, Option<GitStatus>);
+
+/// 前面で動いているシェル以外のプログラム（Claude Code など）の作業。
+///
+/// そのプログラムが前面に来てから変わったファイルに ● を付けるため、来たときの時刻とコミットを覚えておく。
+struct Session {
+    /// プログラムのプロセス番号（前面のプロセスグループ）。
+    pid: u32,
+    /// 前面に来た時刻。
+    started: SystemTime,
+    /// 前面に来たときの今のコミット。Git の管理下でなかったなら `None`。
+    base: Option<String>,
+}
+
+/// 前面のプログラムが来た時刻を、気づいた時刻からさかのぼらせる長さ。
+///
+/// 前面が変わったことに気づくのはメインループが回ったとき（最大 50ms ほど後）なので、
+/// 起動してすぐ書き換えるコマンドの変更を取りこぼさないようにする。
+const SESSION_START_MARGIN: Duration = Duration::from_secs(1);
 
 /// 右側のファイル一覧パネル。
 pub struct FilePanel {
@@ -82,7 +103,7 @@ pub struct FilePanel {
     /// 最後に依頼して、まだ結果が届いていないディレクトリ。
     pending: Option<PathBuf>,
     /// Git 係への依頼。
-    git_tx: Sender<PathBuf>,
+    git_tx: Sender<GitRequest>,
     /// Git 係からの結果。
     git_rx: Receiver<GitLoaded>,
     /// Git 係に依頼して、まだ結果が届いていない。
@@ -111,6 +132,8 @@ pub struct FilePanel {
     scroll: usize,
     /// 最後に描いたときの、一覧に使える行数。スクロールしすぎないように覚えておく。
     rows: Cell<usize>,
+    /// 前面で動いているシェル以外のプログラムの作業。前面がシェルなら `None`。
+    session: Option<Session>,
     /// 名前の前にファイルの種類のアイコン（[`icon`]）を付ける（`--icons`）。
     icons: bool,
 }
@@ -140,14 +163,24 @@ impl FilePanel {
     ) -> Self {
         let on_loaded: Arc<dyn Fn() + Send + Sync> = Arc::new(on_loaded);
         let (load_tx, load_rx) = spawn_worker(
-            |dir| read_entries(dir).map_err(|err| err.to_string()),
+            |dir: &PathBuf| read_entries(dir).map_err(|err| err.to_string()),
             Arc::clone(&on_loaded),
         );
         // git status は遅いことがあるので、一覧の読み込みとは別のスレッドで調べる。
         // 同じスレッドだと、git status が終わるまで別のディレクトリへの切り替えが待たされる
-        let (git_tx, git_rx) = spawn_worker(git::status, Arc::clone(&on_loaded));
+        let (git_tx, git_rx) = spawn_worker(
+            |(dir, since): &GitRequest| {
+                git::status(
+                    dir,
+                    since
+                        .as_ref()
+                        .map(|(commit, time)| (commit.as_str(), *time)),
+                )
+            },
+            Arc::clone(&on_loaded),
+        );
         // 更新時刻もファイルごとの問い合わせで遅いことがあるので、別のスレッドで調べる
-        let (mtime_tx, mtime_rx) = spawn_worker(read_mtimes, on_loaded);
+        let (mtime_tx, mtime_rx) = spawn_worker(|dir: &PathBuf| read_mtimes(dir), on_loaded);
         Self {
             shell_pid,
             cwd: start_dir.clone(),
@@ -174,6 +207,7 @@ impl FilePanel {
             filter: String::new(),
             scroll: 0,
             rows: Cell::new(0),
+            session: None,
             icons,
         }
     }
@@ -216,17 +250,44 @@ impl FilePanel {
             }
         }
 
-        while let Ok((dir, marks)) = self.git_rx.try_recv() {
+        // シェル以外のプログラムが前面に来たら、そのプログラムの作業として、それ以降に変わったものを覚え始める
+        let program = foreground.filter(|&pid| Some(pid) != self.shell_pid);
+        if program != self.session.as_ref().map(|session| session.pid) {
+            self.session = program.map(|pid| Session {
+                pid,
+                started: SystemTime::now() - SESSION_START_MARGIN,
+                base: self.git.as_ref().and_then(|git| git.head.clone()),
+            });
+        }
+        let since = self.session.as_ref().and_then(|session| {
+            let base = session.base.clone()?;
+            Some((base, session.started))
+        });
+
+        while let Ok(((dir, asked_since), marks)) = self.git_rx.try_recv() {
             self.git_pending = false;
-            if dir == self.dir && marks != self.git {
+            // 比べるコミットが違う（前のプログラムの作業の）結果は使わない
+            if dir == self.dir && asked_since == since && marks != self.git {
                 self.git = marks;
                 listing_changed = true;
             }
         }
+        // 前面に来たときにまだ Git の結果が届いていなかった（`cd repo && claude` のように移動してすぐ起動した）なら、
+        // 届いたところで比べるコミットを決める。作業が最初にコミットするまでには間があるので、それで間に合う
+        if let Some(session) = &mut self.session
+            && session.base.is_none()
+            && let Some(head) = self.git.as_ref().and_then(|git| git.head.clone())
+        {
+            session.base = Some(head);
+        }
+        let since = self.session.as_ref().and_then(|session| {
+            let base = session.base.clone()?;
+            Some((base, session.started))
+        });
         // 一覧を読み直したら、Git の状態も調べ直す（一覧を先に出し、印はあとから付ける）
         if reloaded && !self.git_pending {
             self.git_pending = true;
-            let _ = self.git_tx.send(self.dir.clone());
+            let _ = self.git_tx.send((self.dir.clone(), since));
         }
 
         while let Ok((dir, mtimes)) = self.mtime_rx.try_recv() {
@@ -414,20 +475,32 @@ impl FilePanel {
         deleted
     }
 
-    /// 最近（[`RECENT_WINDOW`] 以内に）書き換えられたファイルの名前。
+    /// ● を付ける名前。
+    ///
+    /// 最近（[`RECENT_WINDOW`] 以内に）書き換えられたものと、前面のプログラムが来てから変わったもの。
+    /// Git の管理下では、時刻が新しいだけでは付けず、Git の印があるか、中身が変わったものに限る。
+    /// worktree を作ったり checkout したりすると、中身が同じでもファイルが書き出し直されて時刻が新しくなり、
+    /// 全部に ● が付いてしまうため。
     fn recent_names(&self) -> HashSet<String> {
-        let Some(mtimes) = &self.mtimes else {
-            return HashSet::new();
-        };
         let now = SystemTime::now();
-        mtimes
+        let recent_start = now.checked_sub(RECENT_WINDOW).unwrap_or(now);
+        let since = match &self.session {
+            Some(session) => session.started.min(recent_start),
+            None => recent_start,
+        };
+        let mut names: HashSet<String> = self
+            .mtimes
             .iter()
-            .filter(|(_, mtime)| {
-                now.duration_since(**mtime)
-                    .is_ok_and(|age| age <= RECENT_WINDOW)
-            })
+            .flatten()
+            .filter(|(_, mtime)| **mtime >= since)
             .map(|(name, _)| name.clone())
-            .collect()
+            .collect();
+        if let Some(git) = &self.git {
+            names.retain(|name| git.marks.contains_key(name));
+            // プログラムが来たときのコミットから変わったもの（もうコミットしたものも含む）
+            names.extend(git.changed_since.iter().cloned());
+        }
+        names
     }
 
     /// 各ファイルが glob にマッチするかを付け直す。
@@ -836,20 +909,20 @@ fn read_mtimes(dir: &Path) -> Option<HashMap<String, SystemTime>> {
 ///
 /// /mnt/c のような遅い場所を調べても、メインループが止まらないようにするため。
 /// 調べ終わるたびに `notify` を呼ぶ。
-fn spawn_worker<R: Send + 'static>(
-    work: fn(&Path) -> R,
+fn spawn_worker<Q: Send + 'static, R: Send + 'static>(
+    work: fn(&Q) -> R,
     notify: Arc<dyn Fn() + Send + Sync>,
-) -> (Sender<PathBuf>, Receiver<(PathBuf, R)>) {
-    let (request_tx, request_rx) = mpsc::channel::<PathBuf>();
+) -> (Sender<Q>, Receiver<(Q, R)>) {
+    let (request_tx, request_rx) = mpsc::channel::<Q>();
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
-        while let Ok(mut dir) = request_rx.recv() {
+        while let Ok(mut request) = request_rx.recv() {
             // 調べている間に依頼が溜まっていたら、最新のものだけ調べる
             while let Ok(newer) = request_rx.try_recv() {
-                dir = newer;
+                request = newer;
             }
-            let result = work(&dir);
-            if result_tx.send((dir, result)).is_err() {
+            let result = work(&request);
+            if result_tx.send((request, result)).is_err() {
                 return;
             }
             notify();
