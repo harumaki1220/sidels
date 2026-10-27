@@ -222,6 +222,14 @@ fn handle_mouse(
     };
     let in_shell = event.col <= cols && event.row <= rows;
 
+    // 区切り線（パネルの左端の列）をドラッグすると、パネルの幅を変える。
+    // 線はシェルの外なので、中のアプリがマウスを頼んでいても sidels が受け取る
+    let on_divider = event.col == cols + 1 && event.pressed && !event.is_motion();
+    if event.is_left() && (left.resizing || on_divider) {
+        left.resizing = event.pressed;
+        return Some(AppEvent::DragDivider(event.col));
+    }
+
     // パネルの上のホイールは、中のアプリがマウスを頼んでいても一覧のスクロールにする
     if event.is_wheel() && !in_shell {
         let lines = SCROLL_LINES.cast_signed();
@@ -310,6 +318,8 @@ struct LeftButton {
     dragging: bool,
     /// ドラッグしたまま上下の端に来ている（自動スクロール中）。
     edge: Option<AutoScroll>,
+    /// 区切り線を押したまま、まだ離していない（パネルの幅を変えている途中）。
+    resizing: bool,
 }
 
 impl LeftButton {

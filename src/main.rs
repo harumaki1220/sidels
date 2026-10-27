@@ -22,7 +22,7 @@ mod selection;
 mod shell;
 
 use input::spawn_input_thread;
-use layout::{PanelVisibility, pty_size_for, split};
+use layout::{DEFAULT_PANEL_WIDTH, PanelLayout, pty_size_for, split};
 use panel::FilePanel;
 use selection::{AutoScroll, SharedSelection};
 use shell::{Parser, Relay, SCROLLBACK_LINES, read_input, resize, spawn_output_thread};
@@ -56,10 +56,40 @@ const RESTORE_TITLE: &[u8] = b"\x1b[23;0t";
 /// `sidels --help` や、知らない引数のときに出す使い方。
 const USAGE: &str = "\
 使い方:
-  sidels            起動する
-  sidels --icons    ファイルの種類ごとのアイコンを付けて起動する（Nerd Font が必要）
-  sidels init zsh   zsh のシェル連携を出力する（.zshrc に eval \"$(sidels init zsh)\" と書く）
+  sidels [--icons] [--width 列数]
+  sidels init zsh
+
+  --icons       ファイルの種類ごとのアイコンを付ける（Nerd Font が必要）
+  --width 列数  起動したときのパネルの幅（既定は 28。区切り線のドラッグでも変えられる）
+  init zsh      zsh のシェル連携を出力する（.zshrc に eval \"$(sidels init zsh)\" と書く）
 ";
+
+/// 起動の引数。
+struct Options {
+    /// パネルにファイルの種類のアイコンを付ける（`--icons`）。
+    icons: bool,
+    /// 起動したときのパネルの幅（`--width`）。
+    panel_width: u16,
+}
+
+/// 起動の引数を読む。知らない引数や、値の読めない `--width` なら `None`。
+fn parse_options(args: &[String]) -> Option<Options> {
+    let mut options = Options {
+        icons: false,
+        panel_width: DEFAULT_PANEL_WIDTH,
+    };
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            // アイコンは Nerd Font がないと文字化けするが、フォントは外側のターミナルが決めていて調べられない。
+            // なので、使いたい人だけ引数でオンにする
+            "--icons" => options.icons = true,
+            "--width" => options.panel_width = args.next()?.parse().ok()?,
+            _ => options.panel_width = arg.strip_prefix("--width=")?.parse().ok()?,
+        }
+    }
+    Some(options)
+}
 
 /// 別スレッドからメインループに届く知らせ。
 enum AppEvent {
@@ -78,6 +108,8 @@ enum AppEvent {
     Copy(String),
     /// 選択をドラッグしたまま上下の端に来た（`Some`）、または端から離れた・指を離した（`None`）。
     AutoScroll(Option<AutoScroll>),
+    /// パネルとの区切り線がドラッグされた。今マウスがある列（1 始まり）。
+    DragDivider(u16),
     /// パネルの上でホイールが回された。パネルの一覧をこの行数だけスクロールする（負なら上へ）。
     ScrollPanel(isize),
     /// シェル連携から、入力中の内容が届いた（`line` は入力欄の中身、`word` はカーソル直前の単語）。
@@ -90,11 +122,7 @@ enum AppEvent {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // アイコンは Nerd Font がないと文字化けするが、フォントは外側のターミナルが決めていて調べられない。
-    // なので、使いたい人だけ引数でオンにする
-    let icons = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] => false,
-        ["--icons"] => true,
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["init", "zsh"] => {
             print!("{}", shell::ZSH_INIT);
             return Ok(());
@@ -103,10 +131,11 @@ fn main() -> Result<()> {
             print!("{USAGE}");
             return Ok(());
         }
-        _ => {
-            eprint!("{USAGE}");
-            std::process::exit(2);
-        }
+        _ => {}
+    }
+    let Some(options) = parse_options(&args) else {
+        eprint!("{USAGE}");
+        std::process::exit(2);
     };
 
     // rawモード + 別画面に切り替える。パニックしても自動で元に戻る
@@ -124,7 +153,7 @@ fn main() -> Result<()> {
         ratatui_hook(info);
     }));
     // run の中で ? によるエラーが起きても、必ず restore まで来る
-    let result = run(&mut terminal, icons);
+    let result = run(&mut terminal, &options);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = write_raw(mouse::DISABLE);
     let _ = write_raw(RESTORE_TITLE);
@@ -141,13 +170,14 @@ fn write_raw(bytes: &[u8]) -> io::Result<()> {
 
 /// シェルを起動し、終了するまで画面を描き続ける。
 ///
-/// `icons` なら、パネルにファイルの種類ごとのアイコンを付ける。
-fn run(terminal: &mut DefaultTerminal, icons: bool) -> Result<()> {
+/// `options` は起動の引数（アイコンを付けるか、パネルの幅）。
+fn run(terminal: &mut DefaultTerminal, options: &Options) -> Result<()> {
     let size = terminal.size()?;
-    let mut visibility = PanelVisibility::new(size.width);
+    let mut panel_layout = PanelLayout::new(size.width, options.panel_width);
     let (left, _) = split(
         Rect::new(0, 0, size.width, size.height),
-        visibility.is_visible(),
+        panel_layout.is_visible(),
+        panel_layout.panel_width(),
     );
     let mut pty_size = pty_size_for(left);
 
@@ -168,9 +198,14 @@ fn run(terminal: &mut DefaultTerminal, icons: bool) -> Result<()> {
     // パネルはディレクトリを別スレッドで読む。読み終わったら描き直しを頼む
     let panel_tx = tx.clone();
     let shell_pid = child.process_id();
-    let mut panel = FilePanel::new(shell_pid, std::env::current_dir()?, icons, move || {
-        let _ = panel_tx.send(AppEvent::PanelLoaded);
-    });
+    let mut panel = FilePanel::new(
+        shell_pid,
+        std::env::current_dir()?,
+        options.icons,
+        move || {
+            let _ = panel_tx.send(AppEvent::PanelLoaded);
+        },
+    );
 
     // シェルの出力を解釈して今の画面をメモリ上に持つ仮想端末
     let parser = Arc::new(Mutex::new(Parser::new_with_callbacks(
@@ -206,16 +241,22 @@ fn run(terminal: &mut DefaultTerminal, icons: bool) -> Result<()> {
     loop {
         // ウィンドウの大きさが変わっていたら、PTYと仮想端末も合わせる
         let size = terminal.size()?;
-        visibility.set_width(size.width);
-        let panel_visible = visibility.is_visible();
-        let layout = (size.width, size.height, panel_visible);
-        // F12 での出し入れは、待たずにすぐ合わせる（キーを押したのに反応が遅れると、もたついて感じる）
-        let toggled = last_layout.map(|(_, _, visible)| visible) != Some(panel_visible);
+        panel_layout.set_width(size.width);
+        let panel_visible = panel_layout.is_visible();
+        let panel_width = panel_layout.panel_width();
+        let layout = (size.width, size.height, panel_visible, panel_width);
+        // F12 での出し入れは、待たずにすぐ合わせる（キーを押したのに反応が遅れると、もたついて感じる）。
+        // 区切り線のドラッグは、ウィンドウの大きさを変えるときと同じく、手が止まってから合わせる
+        let toggled = last_layout.map(|(_, _, visible, _)| visible) != Some(panel_visible);
         if last_layout != Some(layout) {
             last_layout = Some(layout);
             needs_draw = true;
         }
-        let (left, _) = split(Rect::new(0, 0, size.width, size.height), panel_visible);
+        let (left, _) = split(
+            Rect::new(0, 0, size.width, size.height),
+            panel_visible,
+            panel_width,
+        );
         let new_size = pty_size_for(left);
         let same = |a: PtySize, b: PtySize| (a.rows, a.cols) == (b.rows, b.cols);
         if same(new_size, pty_size) {
@@ -272,12 +313,13 @@ fn run(terminal: &mut DefaultTerminal, icons: bool) -> Result<()> {
 
         if needs_draw {
             needs_draw = false;
-            draw(terminal, &parser, &selection, &panel, panel_visible)?;
+            let panel_area = panel_visible.then_some(panel_width);
+            draw(terminal, &parser, &selection, &panel, panel_area)?;
         }
 
         match wait_for_event(
             &rx,
-            &mut visibility,
+            &mut panel_layout,
             &mut panel,
             &mut auto_scroll,
             &mut reported_input,
@@ -329,12 +371,14 @@ fn scroll_selection(
 }
 
 /// シェル側とパネルを描く。
+///
+/// `panel_width` はパネルの幅。隠しているなら `None`。
 fn draw(
     terminal: &mut DefaultTerminal,
     parser: &Mutex<Parser>,
     selection: &SharedSelection,
     panel: &FilePanel,
-    panel_visible: bool,
+    panel_width: Option<u16>,
 ) -> Result<()> {
     // 入力係とのデッドロックを避けるため、選択範囲は仮想端末より先に読み取っておく
     let selected = *selection.lock().unwrap();
@@ -343,7 +387,11 @@ fn draw(
     terminal.draw(|frame| {
         // draw は直前に画面を測り直すので、size() の後にウィンドウが縮んでいることがある。
         // はみ出して書くとパニックするので、範囲はここで改めて計算する
-        let (left, right) = split(frame.area(), panel_visible);
+        let (left, right) = split(
+            frame.area(),
+            panel_width.is_some(),
+            panel_width.unwrap_or_default(),
+        );
         let parser = parser.lock().unwrap();
         let screen = parser.screen();
 
@@ -369,7 +417,7 @@ fn draw(
             frame.set_cursor_position((left.x + col, left.y + row));
         }
 
-        if panel_visible {
+        if panel_width.is_some() {
             panel.render(frame, right);
         }
     })?;
@@ -393,7 +441,7 @@ enum Wake {
 /// 何も来なくても 50ms ごとに戻り、ウィンドウサイズの変化を拾えるようにしている。
 fn wait_for_event(
     rx: &Receiver<AppEvent>,
-    visibility: &mut PanelVisibility,
+    panel_layout: &mut PanelLayout,
     panel: &mut FilePanel,
     auto_scroll: &mut Option<AutoScroll>,
     reported_input: &mut Option<(String, String)>,
@@ -409,12 +457,13 @@ fn wait_for_event(
         match event {
             AppEvent::Output => changed = true,
             AppEvent::TogglePanel => {
-                visibility.toggle();
+                panel_layout.toggle();
                 changed = true;
             }
             // 読み込みが終わっただけでは描き直さない。中身が変わったかは panel.update が判断する
             AppEvent::PanelLoaded => {}
             AppEvent::ScrollPanel(lines) => changed |= panel.scroll(lines),
+            AppEvent::DragDivider(col) => changed |= panel_layout.drag_divider(col),
             AppEvent::AutoScroll(edge) => *auto_scroll = edge,
             // パネルに反映するかは panel.update が判断する
             AppEvent::ShellInput { line, word } => *reported_input = Some((line, word)),
