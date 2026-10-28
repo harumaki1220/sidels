@@ -35,11 +35,16 @@ pub type Parser = vt100::Parser<Relay>;
 /// vt100 は画面を作るのに使わないものを捨てるので、ここで拾ってメインループに書き込みを頼む。
 pub struct Relay {
     tx: Sender<AppEvent>,
+    /// 履歴を消す命令（`ESC [3J`）が来た。vt100 は扱わないので、出力係が読み終えてから消す（[`clear_scrollback`]）。
+    clear_requested: bool,
 }
 
 impl Relay {
     pub fn new(tx: Sender<AppEvent>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            clear_requested: false,
+        }
     }
 
     fn pass_through(&self, sequence: Vec<u8>) {
@@ -67,6 +72,20 @@ impl vt100::Callbacks for Relay {
     // OSC 0（アイコン名とタイトル）でも呼ばれる。アイコン名は今のターミナルでは使われないので、タイトルだけ伝える
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.pass_through([b"\x1b]2;", title, b"\x07"].concat());
+    }
+
+    // `clear` は画面を消す `ESC [2J` に続けて `ESC [3J` を出す。普通のターミナルは履歴も消すので合わせる
+    fn unhandled_csi(
+        &mut self,
+        _: &mut vt100::Screen,
+        i1: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        if i1.is_none() && c == 'J' && params == [[3]] {
+            self.clear_requested = true;
+        }
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
@@ -136,7 +155,12 @@ pub fn spawn_output_thread(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     // 外側に伝える制御文字列は、ここで解釈する間に Relay がメインループに送る
-                    parser.lock().unwrap().process(&buf[..n]);
+                    let mut parser = parser.lock().unwrap();
+                    parser.process(&buf[..n]);
+                    if std::mem::take(&mut parser.callbacks_mut().clear_requested) {
+                        clear_scrollback(&mut parser);
+                    }
+                    drop(parser);
                     if tx.send(AppEvent::Output).is_err() {
                         return;
                     }
@@ -145,6 +169,24 @@ pub fn spawn_output_thread(
         }
         let _ = tx.send(AppEvent::Exited);
     });
+}
+
+/// 仮想端末の履歴を消す。
+///
+/// vt100 には履歴だけを消す手段がないので、今の画面（文字・色・カーソル・入力のモード）を写した
+/// 新しい仮想端末に取り替える。vim などが別画面を使っている間は、裏の画面まで写せないので消さない。
+/// 選択範囲はそのままでよい。見えている行は同じ位置に残り、消えた履歴の行は読めないだけになる。
+fn clear_scrollback(parser: &mut Parser) {
+    let screen = parser.screen();
+    if screen.alternate_screen() {
+        return;
+    }
+    let (rows, cols) = screen.size();
+    let state = screen.state_formatted();
+    let relay = Relay::new(parser.callbacks().tx.clone());
+    let mut fresh = Parser::new_with_callbacks(rows, cols, SCROLLBACK_LINES, relay);
+    fresh.process(&state);
+    *parser = fresh;
 }
 
 /// 画面から入力中の内容を読む。
@@ -260,6 +302,25 @@ mod tests {
         );
         assert_eq!(report(b"0", &[b""]), Some((String::new(), String::new())));
         assert_eq!(report(b"x", &[b"ls"]), None);
+    }
+
+    #[test]
+    fn clear_drops_history_but_keeps_the_screen() {
+        let (tx, _rx) = mpsc::channel();
+        let mut parser = Parser::new_with_callbacks(3, 20, 100, Relay::new(tx));
+        parser.process(b"1\r\n2\r\n3\r\n4\r\n5\r\n\x1b[31mred\x1b[0m");
+        parser.process(b"\x1b[3J");
+        assert!(parser.callbacks().clear_requested);
+        clear_scrollback(&mut parser);
+        // 履歴（1, 2, 3）は消え、見えている画面（4, 5, red）と色・カーソルは残る
+        parser.screen_mut().set_scrollback(10);
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert_eq!(parser.screen().contents(), "4\n5\nred");
+        assert_eq!(parser.screen().cursor_position(), (2, 3));
+        assert_eq!(
+            parser.screen().cell(2, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
     }
 
     #[test]
